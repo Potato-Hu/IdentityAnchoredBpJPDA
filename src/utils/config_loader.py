@@ -97,6 +97,16 @@ def get_policy_input_mode(path: str | Path | None = None) -> str:
     return str(policy_input_config.get("mode", "local_only")).lower()
 
 
+def get_policy_association_method(path: str | Path | None = None) -> str:
+    """Read the configured policy association method."""
+
+    env_config = get_env_config(path)
+    policy_input_config = env_config.get("policy_input", {})
+    if not isinstance(policy_input_config, dict):
+        policy_input_config = {}
+    return str(policy_input_config.get("association_method", "none")).lower()
+
+
 def get_global_sensing_config(path: str | Path | None = None) -> dict[str, float]:
     """Read external global-sensing settings from env config."""
 
@@ -123,6 +133,8 @@ def get_local_sensing_config(path: str | Path | None = None) -> dict[str, float 
         "detection_radius_m": float(sensing_config.get("detection_radius_m", 50.0)),
         "max_candidates": int(sensing_config.get("max_candidates", 5)),
         "local_position_noise_std_m": float(sensing_config.get("local_position_noise_std_m", 1.0)),
+        "detection_probability": float(sensing_config.get("detection_probability", 0.95)),
+        "clutter_rate_per_second": float(sensing_config.get("clutter_rate_per_second", 1.0)),
     }
 
 

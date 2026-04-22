@@ -11,14 +11,14 @@
 
 scenario:
   # Number of key enemy UAVs that define the real jamming objective.
-  key_enemy_count: 3
+  key_enemy_count: 2
 
   # Number of non-key enemy UAVs kept in the scene as clutter.
   # They are generated with the same scene initialization rules as ground_truth.py.
   nonkey_enemy_count: 6
 
   # Number of friendly UAV agents controlled by MAPPO.
-  friendly_uav_count: 3
+  friendly_uav_count: 2
 
 baseline_assumptions:
   # This section documents the temporary assumptions of the simple test version.

@@ -109,8 +109,6 @@ def export_trained_policy_trajectory(
 ) -> dict[str, Path | list[Path]]:
     resolved_checkpoint = resolve_export_checkpoint(checkpoint_path, config_path)
     env, _ = initialize_simple_baseline_env(config_path)
-    if seed is not None:
-        env.seed = int(seed)
     config = get_mappo_config(config_path)
     trainer = MAPPO(env=env, config=config, device=device)
     payload = restore_training_state(
@@ -123,7 +121,7 @@ def export_trained_policy_trajectory(
     )
     trainer.load_value_normalizer_state(payload.get("value_normalizer_state"))
 
-    scene, trajectories, stats = rollout_policy_episode(trainer, deterministic=True)
+    scene, trajectories, stats = rollout_policy_episode(trainer, deterministic=True, seed=seed)
 
     output_root = Path(output_dir)
     output_root.mkdir(parents=True, exist_ok=True)

@@ -32,6 +32,8 @@ def build_simple_baseline_env(config_path: str | Path | None = None) -> SwarmEnv
     scenario_config = config.get("scenario", {})
     training_config = config.get("training", {})
     baseline_assumptions = config.get("baseline_assumptions", {})
+    raw_seed = training_config.get("seed", 42)
+    seed = None if raw_seed is None else int(raw_seed)
 
     if not bool(baseline_assumptions.get("use_ground_truth_scene_rules", True)):
         raise ValueError(
@@ -48,7 +50,7 @@ def build_simple_baseline_env(config_path: str | Path | None = None) -> SwarmEnv
         mydrone_num=int(scenario_config.get("friendly_uav_count", 3)),
         dt=get_simulation_dt(),
         max_steps=get_num_steps(),
-        seed=int(training_config.get("seed", 42)),
+        seed=seed,
     )
 
 
@@ -149,6 +151,12 @@ def train_simple_baseline(
         print(f"Resuming training from checkpoint: {resume_checkpoint}")
         print(f"Resume starts at update {start_update} / target {num_updates}")
 
+    print("------")
+    if env.policy_input_mode == "local_only":
+        print(f"policy_input.mode={env.policy_input_mode}, association_method={env.association_method}")
+    else:
+        print(f"policy_input.mode={env.policy_input_mode}")
+    print("------")
     print("Simple MAPPO debug training started.")
     print(
         " | ".join(

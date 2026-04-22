@@ -21,7 +21,13 @@ from src.env.spaces import (
 )
 from src.env.world import SwarmWorld
 from src.rl.reward import compute_difference_rewards, compute_distance_assignment, compute_power_progress_rewards
-from src.sensing.association import AssociationOutput, empty_association_output
+from src.sensing.association import (
+    AssociationOutput,
+    association_output_to_one_hot,
+    empty_association_output,
+    nearest_local_candidate_association_for_friendlies,
+    nearest_neighbor_association_for_friendlies,
+)
 from src.sensing.global_sensor import DelayedNoisyKeyTargetSensor, GlobalKeyTargetSensingConfig
 from src.sensing.local_sensor import LocalSensingConfig, LocalTargetObservation, LocalTargetSensor
 from src.sensing.observation_builder import build_policy_enemy_view
@@ -30,12 +36,14 @@ from src.utils.config_loader import (
     get_global_sensing_config,
     get_local_sensing_config,
     get_num_steps,
+    get_policy_association_method,
     get_policy_input_mode,
     get_reward_config,
 )
 
 
 POLICY_INPUT_MODES = {"local_only", "groundtruth"}
+ASSOCIATION_METHODS = {"none", "nn"}
 
 
 @dataclass
@@ -93,6 +101,12 @@ class SwarmEnv:
                 "policy_input.mode must be either 'local_only' or 'groundtruth', "
                 f"got {self.policy_input_mode!r}."
             )
+        self.association_method = get_policy_association_method()
+        if self.association_method not in ASSOCIATION_METHODS:
+            raise ValueError(
+                "policy_input.association_method must be either 'none' or 'NN', "
+                f"got {self.association_method!r}."
+            )
 
         # Reward hyperparameters for the shared team reward used by all friendly UAVs.
         reward_config = get_reward_config()
@@ -128,6 +142,9 @@ class SwarmEnv:
             detection_radius_m=float(local_sensing_config["detection_radius_m"]),
             max_candidates=int(local_sensing_config["max_candidates"]),
             position_noise_std_m=float(local_sensing_config["local_position_noise_std_m"]),
+            detection_probability=float(local_sensing_config["detection_probability"]),
+            clutter_rate_per_second=float(local_sensing_config["clutter_rate_per_second"]),
+            dt_seconds=self.dt,
         )
         self.local_target_sensor = LocalTargetSensor(local_sensor_config, seed=self.seed)
 
@@ -142,7 +159,10 @@ class SwarmEnv:
         self._previous_assigned_distances: np.ndarray | None = None
         self._last_observations: dict[str, np.ndarray] | None = None
         self._last_observation_time_step: int | None = None
+        self._last_local_observations: dict[str, LocalTargetObservation] | None = None
+        self._last_local_observation_time_step: int | None = None
         self._reset_count = 0
+        self._episode_seed_rng = np.random.default_rng(seed)
 
     def reset(
         self,
@@ -155,6 +175,7 @@ class SwarmEnv:
         if seed is not None:
             self.seed = seed
             self._reset_count = 0
+            self._episode_seed_rng = np.random.default_rng(seed)
         if initial_positions is not None:
             self.initial_positions = initial_positions
 
@@ -176,6 +197,8 @@ class SwarmEnv:
         self.local_target_sensor.reset(seed=episode_seed)
         self._last_observations = None
         self._last_observation_time_step = None
+        self._last_local_observations = None
+        self._last_local_observation_time_step = None
         self._build_spaces()
         self._reset_tracking_memory()
 
@@ -189,6 +212,7 @@ class SwarmEnv:
                 "key_enemy_interference_dbm": self.world.interference.key_enemy_received_dbm.copy(),
                 "key_enemy_interference_watts": self.world.interference.key_enemy_received_watts.copy(),
                 "policy_input_mode": self.policy_input_mode,
+                "association_method": self.association_method,
                 "episode_seed": episode_seed,
             }
             for idx, agent_id in enumerate(self.agent_ids)
@@ -272,6 +296,7 @@ class SwarmEnv:
                 "key_enemy_interference_dbm": result.key_enemy_interference_dbm.copy(),
                 "key_enemy_interference_watts": result.key_enemy_interference_watts.copy(),
                 "policy_input_mode": self.policy_input_mode,
+                "association_method": self.association_method,
                 "reward_mode": self.reward_mode,
                 "difference_reward": float(difference_rewards[idx]),
                 "tracking_reward": float(tracking_rewards[idx]),
@@ -308,7 +333,7 @@ class SwarmEnv:
 
     def _next_episode_seed(self) -> int | None:
         if self.seed is None:
-            return None
+            return int(self._episode_seed_rng.integers(0, np.iinfo(np.int32).max))
         episode_seed = int(self.seed) + self._reset_count
         self._reset_count += 1
         return episode_seed
@@ -345,11 +370,32 @@ class SwarmEnv:
         )
 
     def get_association_outputs(self) -> dict[str, AssociationOutput]:
-        """Return placeholder association outputs without feeding them to actor/critic."""
+        """Return association outputs without feeding them to actor/critic."""
 
         if self.world is None:
             raise RuntimeError("reset() must be called before reading association outputs.")
-        return {agent_id: empty_association_output() for agent_id in self.agent_ids}
+        if self.policy_input_mode != "local_only":
+            return {agent_id: empty_association_output() for agent_id in self.agent_ids}
+
+        local_observations = self._get_current_local_observations()
+        if self.association_method == "none":
+            return nearest_local_candidate_association_for_friendlies(
+                local_observations=local_observations,
+                agent_ids=self.agent_ids,
+            )
+
+        global_key_priors = self.get_global_key_priors()
+        if global_key_priors.size == 0:
+            return {agent_id: empty_association_output() for agent_id in self.agent_ids}
+
+        friendly_positions = self.world.get_friendly_positions()
+        return nearest_neighbor_association_for_friendlies(
+            friendly_positions=friendly_positions,
+            global_target_positions=global_key_priors,
+            local_observations=local_observations,
+            agent_ids=self.agent_ids,
+            detection_radius_m=float(self.local_target_sensor.config.detection_radius_m),
+        )
 
     def get_global_state(self) -> np.ndarray:
         """Return the critic state for the configured policy-input mode."""
@@ -393,6 +439,18 @@ class SwarmEnv:
             )
             for idx, agent_id in enumerate(self.agent_ids)
         }
+
+    def _get_current_local_observations(self) -> dict[str, LocalTargetObservation]:
+        if self.world is None:
+            raise RuntimeError("reset() must be called before get_local_observations().")
+        if (
+            self._last_local_observation_time_step == self.world.time_step
+            and self._last_local_observations is not None
+        ):
+            return self._last_local_observations
+        self._last_local_observations = self.get_local_observations()
+        self._last_local_observation_time_step = self.world.time_step
+        return self._last_local_observations
 
     def _build_spaces(self) -> None:
         if self.world is None or not self.world.friendly_uavs:
@@ -441,20 +499,27 @@ class SwarmEnv:
         if self.world is None:
             raise RuntimeError("reset() must be called before building observations.")
 
-        local_observations = self.get_local_observations()
+        local_observations = self._get_current_local_observations()
+        association_outputs = self.get_association_outputs()
         friendly_positions = self.world.get_friendly_positions()
         bounds = np.asarray(self.world.bounds, dtype=float)
+        max_local_candidates = int(self.local_target_sensor.config.max_candidates)
         observations: dict[str, np.ndarray] = {}
         for idx, agent_id in enumerate(self.agent_ids):
             self_position = friendly_positions[idx]
             self_position_normalized = self_position / bounds
             local_observation = local_observations[agent_id]
             local_relative = local_observation.relative_positions / bounds
+            association_one_hot = association_output_to_one_hot(
+                association_outputs[agent_id],
+                max_local_candidates=max_local_candidates,
+            )
             observation = np.concatenate(
                 [
                     self_position_normalized,
                     local_relative.reshape(-1),
                     local_observation.mask,
+                    association_one_hot,
                 ]
             ).astype(np.float32)
             observations[agent_id] = observation
@@ -486,8 +551,8 @@ class SwarmEnv:
         for idx, agent_id in enumerate(self.agent_ids):
             self_position = friendly_positions[idx]
             self_position_normalized = self_position / bounds
-            enemy_relative = (enemy_positions - self_position) / bounds
-            enemy_features = np.column_stack([enemy_relative, enemy_is_key]).reshape(-1)
+            enemy_position_features = enemy_positions / bounds
+            enemy_features = np.column_stack([enemy_position_features, enemy_is_key]).reshape(-1)
             key_distances = (
                 np.linalg.norm(key_enemy_positions - self_position, axis=1) / distance_norm
                 if key_enemy_positions.size

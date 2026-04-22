@@ -52,7 +52,7 @@ def build_action_spaces(num_friendlies: int, action_dim: int) -> dict[str, Any]:
 
 
 def local_only_observation_dim(max_local_candidates: int) -> int:
-    return 3 + 3 * max_local_candidates + max_local_candidates
+    return 3 + 3 * max_local_candidates + max_local_candidates + max_local_candidates
 
 
 def groundtruth_observation_dim(num_friendlies: int, num_enemies: int, num_key_enemies: int) -> int:
