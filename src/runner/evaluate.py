@@ -21,6 +21,7 @@ def _clone_env_for_evaluation(env: SwarmEnv, seed: int | None) -> SwarmEnv:
         enemy_vmax=env.enemy_vmax,
         friendly_vmax=env.friendly_vmax,
         initial_positions=env.initial_positions,
+        nearby_distance_limits=env.nearby_distance_limits,
         tau_ally=env.tau_ally,
         lambda_safety=env.lambda_safety,
         J0=env.J0,

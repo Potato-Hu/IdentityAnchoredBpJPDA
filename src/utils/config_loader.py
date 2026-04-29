@@ -45,6 +45,27 @@ def get_mappo_config(path: str | Path | None = None) -> dict[str, Any]:
     return load_yaml_config(path or _MAPPO_CONFIG_PATH)
 
 
+def get_mappo_nearby_distance_limits(scenario_config: dict[str, Any]) -> dict[str, tuple[float, float]]:
+    """Read per-entity nearby initialization distance limits from mappo.yaml scenario config."""
+
+    def read_limits(key: str) -> tuple[float, float] | None:
+        limits = scenario_config.get(key)
+        if limits is None:
+            return None
+        if not isinstance(limits, dict):
+            raise ValueError(f"scenario.{key} must be a mapping with min_m and max_m.")
+        return (float(limits["min_m"]), float(limits["max_m"]))
+
+    resolved: dict[str, tuple[float, float]] = {}
+    nonkey_limits = read_limits("nonkey_enemy_nearby_distance")
+    if nonkey_limits is not None:
+        resolved["nonkey_enemy"] = nonkey_limits
+    friendly_limits = read_limits("friendly_uav_nearby_distance")
+    if friendly_limits is not None:
+        resolved["friend_drone"] = friendly_limits
+    return resolved
+
+
 def get_enemy_mobility_config(path: str | Path | None = None) -> dict[str, Any]:
     env_config = get_env_config(path)
     mobility_config = env_config.get("enemy_mobility", {})
@@ -135,6 +156,24 @@ def get_local_sensing_config(path: str | Path | None = None) -> dict[str, float 
         "local_position_noise_std_m": float(sensing_config.get("local_position_noise_std_m", 1.0)),
         "detection_probability": float(sensing_config.get("detection_probability", 0.95)),
         "clutter_rate_per_second": float(sensing_config.get("clutter_rate_per_second", 1.0)),
+    }
+
+
+def get_association_config(path: str | Path | None = None) -> dict[str, float | int]:
+    """Read association-module settings from env config."""
+
+    env_config = get_env_config(path)
+    association_config = env_config.get("association", {})
+    if not isinstance(association_config, dict):
+        association_config = {}
+
+    return {
+        "bp_jpda_gate_sigma": float(association_config.get("bp_jpda_gate_sigma", 3.0)),
+        "bp_jpda_max_iterations": int(association_config.get("bp_jpda_max_iterations", 20)),
+        "bp_jpda_convergence_tol": float(association_config.get("bp_jpda_convergence_tol", 1.0e-3)),
+        "bp_jpda_min_missed_detection_probability": float(
+            association_config.get("bp_jpda_min_missed_detection_probability", 0.05)
+        ),
     }
 
 

@@ -20,6 +20,16 @@ scenario:
   # Number of friendly UAV agents controlled by MAPPO.
   friendly_uav_count: 2
 
+  # Initial distance range from each non-key enemy UAV to its assigned key enemy UAV.
+  nonkey_enemy_nearby_distance:
+    min_m: 5.0
+    max_m: 20.0
+
+  # Initial distance range from each friendly UAV to its assigned key enemy UAV.
+  friendly_uav_nearby_distance:
+    min_m: 10.0
+    max_m: 20.0
+
 baseline_assumptions:
   # This section documents the temporary assumptions of the simple test version.
   # It is meant for readability and future replacement, not for algorithm logic.
@@ -136,3 +146,7 @@ logging:
 
   # Directory used to save training logs and curves.
   log_dir: outputs/logs
+
+  # Whether trajectory export should also save per-key curves of
+  # nearest-friendly distance versus time.
+  display_distance: true

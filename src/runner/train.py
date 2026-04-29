@@ -20,7 +20,7 @@ from src.env.swarm_env import SwarmEnv
 from src.rl.mappo import MAPPO
 from src.runner.evaluate import evaluate_policy
 from src.utils.checkpoint import find_latest_checkpoint, restore_training_state, save_checkpoint
-from src.utils.config_loader import get_mappo_config, get_num_steps, get_simulation_dt
+from src.utils.config_loader import get_mappo_config, get_mappo_nearby_distance_limits, get_num_steps, get_simulation_dt
 from src.utils.logger import TrainingLogger
 from src.visualization.plot_training import plot_training_history
 
@@ -51,6 +51,7 @@ def build_simple_baseline_env(config_path: str | Path | None = None) -> SwarmEnv
         dt=get_simulation_dt(),
         max_steps=get_num_steps(),
         seed=seed,
+        nearby_distance_limits=get_mappo_nearby_distance_limits(scenario_config),
     )
 
 

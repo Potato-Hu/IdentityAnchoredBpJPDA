@@ -13,6 +13,7 @@ from src.runner.train import initialize_simple_baseline_env
 from src.utils.checkpoint import find_best_checkpoint, restore_training_state
 from src.utils.config_loader import get_mappo_config
 from src.visualization.plot_scene import (
+    plot_key_enemy_nearest_friendly_distance_curves,
     plot_key_enemy_interference_curves,
     plot_scene_snapshot,
     plot_trained_policy_trajectories,
@@ -20,6 +21,13 @@ from src.visualization.plot_scene import (
 
 
 def _key_interference_figure_paths(scene, base_path: Path) -> list[Path]:
+    key_labels = [f"E{idx + 1}" for idx, node in enumerate(scene.enemy_nodes) if node.role == "key"]
+    if not key_labels:
+        return []
+    return [base_path.with_name(f"{base_path.stem}_{label}{base_path.suffix}") for label in key_labels]
+
+
+def _key_distance_figure_paths(scene, base_path: Path) -> list[Path]:
     key_labels = [f"E{idx + 1}" for idx, node in enumerate(scene.enemy_nodes) if node.role == "key"]
     if not key_labels:
         return []
@@ -110,6 +118,7 @@ def export_trained_policy_trajectory(
     resolved_checkpoint = resolve_export_checkpoint(checkpoint_path, config_path)
     env, _ = initialize_simple_baseline_env(config_path)
     config = get_mappo_config(config_path)
+    logging_config = config.get("logging", {})
     trainer = MAPPO(env=env, config=config, device=device)
     payload = restore_training_state(
         path=resolved_checkpoint,
@@ -133,6 +142,9 @@ def export_trained_policy_trajectory(
     key_interference_csv = output_root / "trained_policy_key_enemy_interference.csv"
     key_interference_pdf = output_root / "trained_policy_key_enemy_interference.pdf"
     key_interference_pdfs = _key_interference_figure_paths(scene, key_interference_pdf)
+    display_distance = bool(logging_config.get("display_distance", False))
+    key_distance_pdf = output_root / "trained_policy_key_enemy_nearest_friendly_distance.pdf"
+    key_distance_pdfs = _key_distance_figure_paths(scene, key_distance_pdf) if display_distance else []
 
     np.savez(
         trajectory_npz,
@@ -181,6 +193,14 @@ def export_trained_policy_trajectory(
         title="Trained MAPPO Key Enemy Received Interference Power",
         show=show,
     )
+    if display_distance:
+        plot_key_enemy_nearest_friendly_distance_curves(
+            scene=scene,
+            trajectories=trajectories,
+            save_path=key_distance_pdf,
+            title="Trained MAPPO Key Enemy Nearest Friendly Distance",
+            show=show,
+        )
 
     print(f"Loaded checkpoint: {resolved_checkpoint}")
     if seed is not None:
@@ -194,6 +214,8 @@ def export_trained_policy_trajectory(
     print(f"Saved key enemy interference CSV: {key_interference_csv}")
     for figure_path in key_interference_pdfs:
         print(f"Saved key enemy interference figure: {figure_path}")
+    for figure_path in key_distance_pdfs:
+        print(f"Saved key enemy nearest-friendly distance figure: {figure_path}")
 
     return {
         "checkpoint": resolved_checkpoint,
@@ -203,6 +225,7 @@ def export_trained_policy_trajectory(
         "positions_csv": positions_csv,
         "key_interference_csv": key_interference_csv,
         "key_interference_pdfs": key_interference_pdfs,
+        "key_distance_pdfs": key_distance_pdfs,
     }
 
 

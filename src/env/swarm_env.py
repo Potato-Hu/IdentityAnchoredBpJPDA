@@ -23,7 +23,8 @@ from src.env.world import SwarmWorld
 from src.rl.reward import compute_difference_rewards, compute_distance_assignment, compute_power_progress_rewards
 from src.sensing.association import (
     AssociationOutput,
-    association_output_to_one_hot,
+    association_output_to_weight_vector,
+    bp_jpda_association_for_friendlies,
     empty_association_output,
     nearest_local_candidate_association_for_friendlies,
     nearest_neighbor_association_for_friendlies,
@@ -31,8 +32,10 @@ from src.sensing.association import (
 from src.sensing.global_sensor import DelayedNoisyKeyTargetSensor, GlobalKeyTargetSensingConfig
 from src.sensing.local_sensor import LocalSensingConfig, LocalTargetObservation, LocalTargetSensor
 from src.sensing.observation_builder import build_policy_enemy_view
-from src.simulation.ground_truth import PositionDict, ScenarioGroundTruth, initialize_scene
+from src.simulation.ground_truth import NearbyDistanceLimits, PositionDict, ScenarioGroundTruth, initialize_scene
 from src.utils.config_loader import (
+    get_association_config,
+    get_enemy_vmax,
     get_global_sensing_config,
     get_local_sensing_config,
     get_num_steps,
@@ -43,7 +46,7 @@ from src.utils.config_loader import (
 
 
 POLICY_INPUT_MODES = {"local_only", "groundtruth"}
-ASSOCIATION_METHODS = {"none", "nn"}
+ASSOCIATION_METHODS = {"none", "nn", "bp_jpda"}
 
 
 @dataclass
@@ -75,6 +78,7 @@ class SwarmEnv:
         enemy_vmax: float | None = None,
         friendly_vmax: float | None = None,
         initial_positions: PositionDict | None = None,
+        nearby_distance_limits: NearbyDistanceLimits | None = None,
         tau_ally: float | None = None,
         lambda_safety: float | None = None,
         J0: float | None = None,
@@ -94,6 +98,7 @@ class SwarmEnv:
         self.enemy_vmax = enemy_vmax
         self.friendly_vmax = friendly_vmax
         self.initial_positions = initial_positions
+        self.nearby_distance_limits = nearby_distance_limits
         resolved_policy_input_mode = get_policy_input_mode() if policy_input_mode is None else policy_input_mode
         self.policy_input_mode = str(resolved_policy_input_mode).lower()
         if self.policy_input_mode not in POLICY_INPUT_MODES:
@@ -104,9 +109,16 @@ class SwarmEnv:
         self.association_method = get_policy_association_method()
         if self.association_method not in ASSOCIATION_METHODS:
             raise ValueError(
-                "policy_input.association_method must be either 'none' or 'NN', "
+                "policy_input.association_method must be one of 'none', 'nn', or 'bp_jpda', "
                 f"got {self.association_method!r}."
             )
+        association_config = get_association_config()
+        self.bp_jpda_gate_sigma = float(association_config["bp_jpda_gate_sigma"])
+        self.bp_jpda_max_iterations = int(association_config["bp_jpda_max_iterations"])
+        self.bp_jpda_convergence_tol = float(association_config["bp_jpda_convergence_tol"])
+        self.bp_jpda_min_missed_detection_probability = float(
+            association_config["bp_jpda_min_missed_detection_probability"]
+        )
 
         # Reward hyperparameters for the shared team reward used by all friendly UAVs.
         reward_config = get_reward_config()
@@ -190,6 +202,7 @@ class SwarmEnv:
             enemy_vmax=self.enemy_vmax,
             friendly_vmax=self.friendly_vmax,
             initial_positions=self.initial_positions,
+            nearby_distance_limits=self.nearby_distance_limits,
         )
         self.world = SwarmWorld.from_scene(self.scene)
         self.world.reset()
@@ -389,6 +402,28 @@ class SwarmEnv:
             return {agent_id: empty_association_output() for agent_id in self.agent_ids}
 
         friendly_positions = self.world.get_friendly_positions()
+        if self.association_method == "bp_jpda":
+            return bp_jpda_association_for_friendlies(
+                friendly_positions=friendly_positions,
+                global_target_positions=global_key_priors,
+                local_observations=local_observations,
+                agent_ids=self.agent_ids,
+                detection_radius_m=float(self.local_target_sensor.config.detection_radius_m),
+                local_position_noise_std_m=float(self.local_target_sensor.config.position_noise_std_m),
+                global_position_noise_std_m=float(self.global_key_target_sensor.config.position_noise_std_m),
+                prior_delay_seconds=float(self.global_key_target_sensor.config.radar_delay_seconds),
+                target_speed_std_mps=float(
+                    self.enemy_vmax if self.enemy_vmax is not None else get_enemy_vmax()
+                ),
+                local_detection_probability=float(self.local_target_sensor.config.detection_probability),
+                clutter_rate_per_second=float(self.local_target_sensor.config.clutter_rate_per_second),
+                dt_seconds=float(self.local_target_sensor.config.dt_seconds),
+                gate_sigma=self.bp_jpda_gate_sigma,
+                max_iterations=self.bp_jpda_max_iterations,
+                convergence_tol=self.bp_jpda_convergence_tol,
+                min_missed_detection_probability=self.bp_jpda_min_missed_detection_probability,
+            )
+
         return nearest_neighbor_association_for_friendlies(
             friendly_positions=friendly_positions,
             global_target_positions=global_key_priors,
@@ -510,7 +545,7 @@ class SwarmEnv:
             self_position_normalized = self_position / bounds
             local_observation = local_observations[agent_id]
             local_relative = local_observation.relative_positions / bounds
-            association_one_hot = association_output_to_one_hot(
+            association_weights = association_output_to_weight_vector(
                 association_outputs[agent_id],
                 max_local_candidates=max_local_candidates,
             )
@@ -519,7 +554,7 @@ class SwarmEnv:
                     self_position_normalized,
                     local_relative.reshape(-1),
                     local_observation.mask,
-                    association_one_hot,
+                    association_weights,
                 ]
             ).astype(np.float32)
             observations[agent_id] = observation

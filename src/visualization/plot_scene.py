@@ -9,6 +9,7 @@ configure_matplotlib_for_ieee_pdf()
 
 import matplotlib.pyplot as plt
 import numpy as np
+import seaborn as sns
 from matplotlib.lines import Line2D
 from matplotlib.ticker import ScalarFormatter
 from matplotlib.ticker import LinearLocator
@@ -235,24 +236,99 @@ def plot_key_enemy_interference_curves(
 
     for idx in range(powers.shape[1]):
         fig, ax = plt.subplots(figsize=(10, 5.6))
-        ax.plot(
-            time_seconds,
-            powers[:, idx],
-            color=cmap(idx % cmap.N),
-            linewidth=2.0,
-            label=f"{key_labels[idx]} received power",
-        )
+        with sns.axes_style("whitegrid"), sns.plotting_context("notebook"):
+            sns.lineplot(
+                x=time_seconds,
+                y=powers[:, idx],
+                color=cmap(idx % cmap.N),
+                linewidth=2.2,
+                label=f"{key_labels[idx]} received power",
+                ax=ax,
+            )
+        ax.set_facecolor("#F8FAFC")
         if scale == "log_watts":
             ax.set_yscale("log")
         figure_title = f"{title} - {key_labels[idx]}" if title is not None else f"{key_labels[idx]} Received Interference Power"
         ax.set_title(figure_title)
         ax.set_xlabel("Time (s)")
         ax.set_ylabel("Received interference power (dBm)" if scale == "dbm" else "Received interference power (W)")
-        ax.grid(alpha=0.25)
+        ax.grid(True, which="major", alpha=0.28, color="#94A3B8", linewidth=0.8)
+        ax.grid(False, which="minor")
         ax.legend(frameon=False)
+        sns.despine(ax=ax, offset=4)
         if scale == "watts":
             ax.yaxis.set_major_formatter(ScalarFormatter(useMathText=True))
             ax.ticklabel_format(axis="y", style="sci", scilimits=(0, 0))
+        fig.tight_layout()
+
+        if output_path is not None:
+            plt.savefig(_per_key_output_path(output_path, key_labels[idx]), bbox_inches="tight")
+        if show:
+            plt.show()
+        else:
+            plt.close(fig)
+        figures.append((fig, ax))
+
+    return figures
+
+
+def plot_key_enemy_nearest_friendly_distance_curves(
+    scene: ScenarioGroundTruth,
+    trajectories: TrajectoryBundle,
+    save_path: str | Path | None = None,
+    title: str | None = None,
+    show: bool = False,
+):
+    """Plot one nearest-friendly distance curve per key enemy."""
+
+    key_indices = [idx for idx, node in enumerate(scene.enemy_nodes) if node.role == "key"]
+    key_labels = [f"E{idx + 1}" for idx in key_indices]
+    if not key_indices:
+        return []
+
+    enemy_positions = np.asarray(trajectories.enemy_positions[:, key_indices, :], dtype=float)
+    friendly_positions = np.asarray(trajectories.friendly_positions, dtype=float)
+    if enemy_positions.ndim != 3 or friendly_positions.ndim != 3:
+        raise ValueError("enemy_positions and friendly_positions must be 3D arrays over time.")
+
+    pairwise_distances = np.linalg.norm(
+        enemy_positions[:, :, None, :] - friendly_positions[:, None, :, :],
+        axis=-1,
+    )
+    nearest_distances = np.min(pairwise_distances, axis=2) if friendly_positions.shape[1] else np.zeros(
+        (enemy_positions.shape[0], enemy_positions.shape[1]),
+        dtype=float,
+    )
+
+    time_seconds = np.arange(nearest_distances.shape[0], dtype=float) * float(trajectories.dt)
+    cmap = plt.get_cmap("tab10" if nearest_distances.shape[1] <= 10 else "tab20")
+    output_path = _ensure_output_dir(save_path)
+    figures = []
+
+    for idx in range(nearest_distances.shape[1]):
+        fig, ax = plt.subplots(figsize=(10, 5.6))
+        with sns.axes_style("whitegrid"), sns.plotting_context("notebook"):
+            sns.lineplot(
+                x=time_seconds,
+                y=nearest_distances[:, idx],
+                color=cmap(idx % cmap.N),
+                linewidth=2.2,
+                label=f"{key_labels[idx]} nearest friendly distance",
+                ax=ax,
+            )
+        ax.set_facecolor("#F8FAFC")
+        figure_title = (
+            f"{title} - {key_labels[idx]}"
+            if title is not None
+            else f"{key_labels[idx]} Nearest Friendly Distance"
+        )
+        ax.set_title(figure_title)
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel("Nearest friendly distance (m)")
+        ax.grid(True, which="major", alpha=0.28, color="#94A3B8", linewidth=0.8)
+        ax.grid(False, which="minor")
+        ax.legend(frameon=False)
+        sns.despine(ax=ax, offset=4)
         fig.tight_layout()
 
         if output_path is not None:

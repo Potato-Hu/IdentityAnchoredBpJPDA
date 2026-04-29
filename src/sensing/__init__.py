@@ -1,5 +1,7 @@
 from src.sensing.association import (
     AssociationOutput,
+    association_output_to_weight_vector,
+    bp_jpda_association_for_friendlies,
     empty_association_output,
     nearest_local_candidate_association,
     nearest_local_candidate_association_for_friendlies,
@@ -12,6 +14,8 @@ from src.sensing.observation_builder import build_policy_enemy_view, replace_key
 
 __all__ = [
     "AssociationOutput",
+    "association_output_to_weight_vector",
+    "bp_jpda_association_for_friendlies",
     "build_policy_enemy_view",
     "DelayedNoisyKeyTargetSensor",
     "empty_association_output",

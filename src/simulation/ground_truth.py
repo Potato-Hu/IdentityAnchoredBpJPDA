@@ -16,6 +16,7 @@ from src.utils.config_loader import (
 )
 
 PositionDict = Mapping[str, Sequence[Sequence[float]]]
+NearbyDistanceLimits = Mapping[str, Sequence[float]]
 
 
 @dataclass
@@ -65,9 +66,20 @@ def _random_positions(count: int, bounds: np.ndarray, rng: np.random.Generator) 
     return rng.uniform(low=np.zeros(3, dtype=float), high=bounds, size=(count, 3))
 
 
-def _nearby_distance_limits(bounds: np.ndarray) -> tuple[float, float]:
-    min_distance = float(bounds[0] / 40.0)
-    max_distance = float(bounds[0] / 10.0)
+def _nearby_distance_limits(bounds: np.ndarray, limits: Sequence[float] | None = None) -> tuple[float, float]:
+    if limits is None:
+        min_distance = float(bounds[0] / 40.0)
+        max_distance = float(bounds[0] / 10.0)
+    else:
+        distance_limits = np.asarray(limits, dtype=float)
+        if distance_limits.shape != (2,):
+            raise ValueError(f"nearby distance limits must be [min, max], got shape {distance_limits.shape}.")
+        min_distance = float(distance_limits[0])
+        max_distance = float(distance_limits[1])
+    if min_distance < 0.0:
+        raise ValueError("nearby minimum distance must be non-negative.")
+    if max_distance < min_distance:
+        raise ValueError("nearby maximum distance must be greater than or equal to minimum distance.")
     if max_distance <= 0.0:
         raise ValueError("x boundary must be positive to sample nearby initial positions.")
     return min_distance, max_distance
@@ -134,6 +146,7 @@ def _sample_near_anchors(
     rng: np.random.Generator,
     *,
     entity_name: str,
+    distance_limits: Sequence[float] | None = None,
 ) -> np.ndarray:
     positions, _ = _sample_near_anchors_with_indices(
         anchors,
@@ -141,6 +154,7 @@ def _sample_near_anchors(
         bounds,
         rng,
         entity_name=entity_name,
+        distance_limits=distance_limits,
     )
     return positions
 
@@ -152,11 +166,12 @@ def _sample_near_anchors_with_indices(
     rng: np.random.Generator,
     *,
     entity_name: str,
+    distance_limits: Sequence[float] | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     if count == 0:
         return np.zeros((0, 3), dtype=float), np.zeros(0, dtype=int)
 
-    min_distance, max_distance = _nearby_distance_limits(bounds)
+    min_distance, max_distance = _nearby_distance_limits(bounds, distance_limits)
     anchor_indices = _anchor_indices_for_nearby_positions(
         count,
         len(anchors),
@@ -223,6 +238,7 @@ def assign_initial_positions(
     mydrone_num: int,
     bounds: Sequence[float] | None = None,
     initial_positions: PositionDict | None = None,
+    nearby_distance_limits: NearbyDistanceLimits | None = None,
     rng: np.random.Generator | None = None,
 ) -> dict[str, np.ndarray]:
     """
@@ -247,6 +263,7 @@ def assign_initial_positions(
 
     scene_bounds = _as_bounds(bounds)
     manual_positions = dict(initial_positions or {})
+    configured_distance_limits = dict(nearby_distance_limits or {})
     position_rng = rng if rng is not None else np.random.default_rng()
 
     key_positions = (
@@ -264,6 +281,7 @@ def assign_initial_positions(
             scene_bounds,
             position_rng,
             entity_name="nonkey_enemy",
+            distance_limits=configured_distance_limits.get("nonkey_enemy"),
         )
     friendly_positions = (
         _validate_positions("friend_drone", manual_positions["friend_drone"], mydrone_num, scene_bounds)
@@ -274,6 +292,7 @@ def assign_initial_positions(
             scene_bounds,
             position_rng,
             entity_name="friend_drone",
+            distance_limits=configured_distance_limits.get("friend_drone"),
         )
     )
 
@@ -300,6 +319,7 @@ def initialize_scene(
     enemy_vmax: float | None = None,
     friendly_vmax: float | None = None,
     initial_positions: PositionDict | None = None,
+    nearby_distance_limits: NearbyDistanceLimits | None = None,
 ) -> ScenarioGroundTruth:
     scene_bounds = _as_bounds(bounds)
     base_seed = get_default_seed() if seed is None else int(seed)
@@ -319,6 +339,7 @@ def initialize_scene(
         mydrone_num=mydrone_num,
         bounds=scene_bounds,
         initial_positions=initial_positions,
+        nearby_distance_limits=nearby_distance_limits,
         rng=np.random.default_rng(base_seed),
     )
 
