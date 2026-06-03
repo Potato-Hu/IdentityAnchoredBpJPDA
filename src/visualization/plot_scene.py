@@ -188,7 +188,7 @@ def plot_trajectories_until_timestep(
     return fig, ax
 
 
-def plot_trained_policy_trajectories(
+def plot_tracking_rollout_trajectories(
     scene: ScenarioGroundTruth,
     trajectories: TrajectoryBundle,
     save_path: str | Path | None = None,
@@ -201,7 +201,25 @@ def plot_trained_policy_trajectories(
         timestep=trajectories.num_steps,
         target="all",
         save_path=save_path,
-        title=title or "Trained MAPPO Enemy and Friendly Trajectories",
+        title=title or "Tracking Rollout Enemy and Friendly Trajectories",
+        show=show,
+    )
+
+
+def plot_trained_policy_trajectories(
+    scene: ScenarioGroundTruth,
+    trajectories: TrajectoryBundle,
+    save_path: str | Path | None = None,
+    title: str | None = None,
+    show: bool = False,
+):
+    """Backward-compatible alias for the rollout trajectory plot."""
+
+    return plot_tracking_rollout_trajectories(
+        scene=scene,
+        trajectories=trajectories,
+        save_path=save_path,
+        title=title,
         show=show,
     )
 

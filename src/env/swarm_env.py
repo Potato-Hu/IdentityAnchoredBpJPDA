@@ -1,8 +1,4 @@
-"""Minimal multi-agent RL environment skeleton for the swarm project.
-
-This file wraps SwarmWorld into reset/step style APIs and defines placeholder observations,
-rewards, and termination logic so later modules can plug into a stable environment backbone.
-"""
+"""Tracking-oriented environment wrapper for the swarm project."""
 
 from __future__ import annotations
 
@@ -11,66 +7,79 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
-from src.env.spaces import (
-    SwarmSpaceSpec,
-    build_action_spaces,
-    build_agent_ids,
-    build_global_state_space,
-    build_observation_spaces,
-    build_space_spec,
-)
 from src.env.world import SwarmWorld
-from src.rl.reward import compute_difference_rewards, compute_distance_assignment, compute_power_progress_rewards
 from src.sensing.association import (
-    AssociationOutput,
-    association_output_to_weight_vector,
+    BPJPDAFilterState,
+    GMPHDFilterState,
+    KeyTrackPosterior,
+    LMBFilterState,
+    MultiTargetTrackOutput,
+    STATE_DIM,
     bp_jpda_association_for_friendlies,
-    empty_association_output,
+    empty_multi_target_track_output,
+    flatten_track_output,
+    gm_phd_association_for_friendlies,
+    lmb_association_for_friendlies,
     nearest_local_candidate_association_for_friendlies,
-    nearest_neighbor_association_for_friendlies,
 )
-from src.sensing.global_sensor import DelayedNoisyKeyTargetSensor, GlobalKeyTargetSensingConfig
+from src.sensing.delta_glmb import DeltaGLMBFilterState, delta_glmb_association_for_friendlies
+from src.sensing.global_sensor import (
+    GlobalKeyTargetStatePrior,
+    GlobalKeyTargetStatePriorSensor,
+    GlobalKeyTargetSensingConfig,
+)
 from src.sensing.local_sensor import LocalSensingConfig, LocalTargetObservation, LocalTargetSensor
-from src.sensing.observation_builder import build_policy_enemy_view
 from src.simulation.ground_truth import NearbyDistanceLimits, PositionDict, ScenarioGroundTruth, initialize_scene
+from src.tracking.controller import (
+    ControlCommand,
+    build_placeholder_control_commands,
+    build_tracking_control_commands,
+    extract_actions,
+)
+from src.tracking.fusion import FusedTrackSet
+from src.tracking.fusion_center import FusionCenter, LocalTrackSet, build_local_track_sets
+from src.tracking.task_assignment import (
+    TaskAssignmentResult,
+    build_empty_task_assignment,
+    build_hungarian_task_assignment,
+)
 from src.utils.config_loader import (
     get_association_config,
     get_enemy_vmax,
+    get_friendly_vmax,
     get_global_sensing_config,
     get_local_sensing_config,
+    get_num_friendly_uavs,
+    get_num_key_targets,
+    get_num_nonkey_targets,
     get_num_steps,
-    get_policy_association_method,
-    get_policy_input_mode,
-    get_reward_config,
+    get_tracking_association_method,
+    get_tracking_assignment_method,
+    get_tracking_input_mode,
+    get_track_fusion_config,
 )
 
-
-POLICY_INPUT_MODES = {"local_only", "groundtruth"}
-ASSOCIATION_METHODS = {"none", "nn", "bp_jpda"}
+TRACKING_INPUT_MODES = {"local_only", "groundtruth"}
+ASSOCIATION_METHODS = {"none", "bp_jpda", "gm_phd", "lmb", "delta_glmb"}
+ASSIGNMENT_METHODS = {"placeholder", "hungarian"}
 
 
 @dataclass
 class EnvStepOutput:
     observations: dict[str, np.ndarray]
-    rewards: dict[str, float]
     terminated: dict[str, bool]
     truncated: dict[str, bool]
     infos: dict[str, dict[str, Any]]
 
 
 class SwarmEnv:
-    """Lightweight env skeleton built on top of SwarmWorld.
-
-    `local_only` uses legal self state plus anonymous local target candidates for
-    actor/critic inputs. `groundtruth` is a debug mode that trains from full world-truth
-    target features.
-    """
+    """Tracking-oriented env wrapper built on top of SwarmWorld."""
 
     def __init__(
         self,
-        key_num: int = 3,
-        nonkey_num: int = 3,
-        mydrone_num: int = 3,
+        key_num: int | None = None,
+        nonkey_num: int | None = None,
+        mydrone_num: int | None = None,
         bounds: Sequence[float] | None = None,
         dt: float = 1.0,
         max_steps: int | None = None,
@@ -81,37 +90,47 @@ class SwarmEnv:
         nearby_distance_limits: NearbyDistanceLimits | None = None,
         tau_ally: float | None = None,
         lambda_safety: float | None = None,
-        J0: float | None = None,
-        power_weight: float | None = None,
-        progress_weight: float | None = None,
-        progress_distance_scale: float | None = None,
-        move_penalty_weight: float | None = None,
+        distance_scale_m: float | None = None,
+        tracking_input_mode: str | None = None,
         policy_input_mode: str | None = None,
     ) -> None:
-        self.key_num = int(key_num)
-        self.nonkey_num = int(nonkey_num)
-        self.mydrone_num = int(mydrone_num)
+        self.key_num = int(get_num_key_targets() if key_num is None else key_num)
+        self.nonkey_num = int(get_num_nonkey_targets() if nonkey_num is None else nonkey_num)
+        self.mydrone_num = int(get_num_friendly_uavs() if mydrone_num is None else mydrone_num)
         self.bounds = None if bounds is None else np.asarray(bounds, dtype=float)
         self.dt = float(dt)
         self.max_steps = get_num_steps() if max_steps is None else int(max_steps)
         self.seed = seed
-        self.enemy_vmax = enemy_vmax
-        self.friendly_vmax = friendly_vmax
+        self.enemy_vmax = float(get_enemy_vmax() if enemy_vmax is None else enemy_vmax)
+        self.friendly_vmax = float(get_friendly_vmax() if friendly_vmax is None else friendly_vmax)
         self.initial_positions = initial_positions
         self.nearby_distance_limits = nearby_distance_limits
-        resolved_policy_input_mode = get_policy_input_mode() if policy_input_mode is None else policy_input_mode
-        self.policy_input_mode = str(resolved_policy_input_mode).lower()
-        if self.policy_input_mode not in POLICY_INPUT_MODES:
+        self.agent_ids = tuple(f"friendly_{idx}" for idx in range(self.mydrone_num))
+
+        raw_tracking_input_mode = tracking_input_mode if tracking_input_mode is not None else policy_input_mode
+        resolved_tracking_input_mode = (
+            get_tracking_input_mode() if raw_tracking_input_mode is None else raw_tracking_input_mode
+        )
+        self.tracking_input_mode = str(resolved_tracking_input_mode).lower()
+        if self.tracking_input_mode not in TRACKING_INPUT_MODES:
             raise ValueError(
-                "policy_input.mode must be either 'local_only' or 'groundtruth', "
-                f"got {self.policy_input_mode!r}."
+                "tracking.mode must be either 'local_only' or 'groundtruth', "
+                f"got {self.tracking_input_mode!r}."
             )
-        self.association_method = get_policy_association_method()
+
+        self.association_method = get_tracking_association_method()
         if self.association_method not in ASSOCIATION_METHODS:
             raise ValueError(
-                "policy_input.association_method must be one of 'none', 'nn', or 'bp_jpda', "
+                "tracking.association_method must be one of 'none', 'bp_jpda', 'gm_phd', 'lmb', or 'delta_glmb', "
                 f"got {self.association_method!r}."
             )
+        self.assignment_method = get_tracking_assignment_method()
+        if self.assignment_method not in ASSIGNMENT_METHODS:
+            raise ValueError(
+                "tracking.assignment must be one of 'placeholder' or 'hungarian', "
+                f"got {self.assignment_method!r}."
+            )
+
         association_config = get_association_config()
         self.bp_jpda_gate_sigma = float(association_config["bp_jpda_gate_sigma"])
         self.bp_jpda_max_iterations = int(association_config["bp_jpda_max_iterations"])
@@ -119,60 +138,82 @@ class SwarmEnv:
         self.bp_jpda_min_missed_detection_probability = float(
             association_config["bp_jpda_min_missed_detection_probability"]
         )
+        self.recursive_motion_model = str(association_config["recursive_motion_model"]).lower()
+        self.imm_model_types = tuple(str(model_type) for model_type in association_config["imm_model_types"])
+        self.imm_model_transition_matrix = association_config["imm_model_transition_matrix"]
+        self.imm_initial_model_probabilities = association_config["imm_initial_model_probabilities"]
+        self.imm_turn_rate_radps = float(association_config["imm_turn_rate_radps"])
+        self.imm_ct_process_noise_scale = float(association_config["imm_ct_process_noise_scale"])
+        self.gm_phd_survival_probability = float(association_config["gm_phd_survival_probability"])
+        self.gm_phd_birth_weight = float(association_config["gm_phd_birth_weight"])
+        self.gm_phd_prune_threshold = float(association_config["gm_phd_prune_threshold"])
+        self.gm_phd_merge_mahalanobis = float(association_config["gm_phd_merge_mahalanobis"])
+        self.gm_phd_max_components = int(association_config["gm_phd_max_components"])
+        self.gm_phd_confidence_threshold = float(association_config["gm_phd_confidence_threshold"])
+        self.delta_glmb_max_hypotheses = int(association_config["delta_glmb_max_hypotheses"])
+        self.delta_glmb_hypothesis_weight_prune_threshold = float(
+            association_config["delta_glmb_hypothesis_weight_prune_threshold"]
+        )
+        self.gm_phd_process_position_std_m = np.asarray(
+            association_config["gm_phd_process_position_std_m"], dtype=float
+        )
+        self.gm_phd_process_velocity_std_mps = np.asarray(
+            association_config["gm_phd_process_velocity_std_mps"], dtype=float
+        )
+        fusion_config = get_track_fusion_config()
+        self.fusion_self_position_std_m = np.asarray(fusion_config["self_position_std_m"], dtype=float)
+        self.fusion_min_confidence = float(fusion_config["min_confidence"])
+        self.fusion_mahalanobis_distance_threshold = float(
+            fusion_config["mahalanobis_distance_threshold"]
+        )
+        self.fusion_ci_search_steps = int(fusion_config["ci_search_steps"])
+        self.fusion_center = FusionCenter(
+            self_position_std_m=self.fusion_self_position_std_m,
+            min_confidence=self.fusion_min_confidence,
+            mahalanobis_distance_threshold=self.fusion_mahalanobis_distance_threshold,
+            ci_search_steps=self.fusion_ci_search_steps,
+        )
 
-        # Reward hyperparameters for the shared team reward used by all friendly UAVs.
-        reward_config = get_reward_config()
-        self.reward_mode = str(reward_config["reward_mode"]).lower()
-        if self.reward_mode not in {"difference", "sustained_tracking"}:
-            raise ValueError(
-                "reward.reward_mode must be either 'difference' or 'sustained_tracking', "
-                f"got {self.reward_mode!r}."
-            )
-        self.tau_ally = float(reward_config["tau_ally"] if tau_ally is None else tau_ally)
-        self.lambda_safety = float(reward_config["lambda_safety"] if lambda_safety is None else lambda_safety)
-        self.J0 = float(reward_config["J0"] if J0 is None else J0)
-        self.power_weight = float(reward_config["power_weight"] if power_weight is None else power_weight)
-        self.progress_weight = float(reward_config["progress_weight"] if progress_weight is None else progress_weight)
-        self.progress_distance_scale = float(
-            reward_config["progress_distance_scale"]
-            if progress_distance_scale is None
-            else progress_distance_scale
-        )
-        self.move_penalty_weight = float(
-            reward_config["move_penalty_weight"]
-            if move_penalty_weight is None
-            else move_penalty_weight
-        )
         sensing_config = get_global_sensing_config()
         global_sensor_config = GlobalKeyTargetSensingConfig(
-            radar_delay_seconds=float(sensing_config["radar_delay_seconds"]),
-            position_noise_std_m=float(sensing_config["key_enemy_position_noise_std_m"]),
+            prior_position_std_m=np.asarray(sensing_config["prior_position_std_m"], dtype=float),
+            prior_velocity_std_mps=np.asarray(sensing_config["prior_velocity_std_mps"], dtype=float),
         )
-        self.global_key_target_sensor = DelayedNoisyKeyTargetSensor(global_sensor_config, seed=self.seed)
+        self.global_key_target_sensor = GlobalKeyTargetStatePriorSensor(global_sensor_config, seed=self.seed)
+
         local_sensing_config = get_local_sensing_config()
+        self.relative_velocity_limit_mps = float(self.enemy_vmax + self.friendly_vmax)
         local_sensor_config = LocalSensingConfig(
             detection_radius_m=float(local_sensing_config["detection_radius_m"]),
             max_candidates=int(local_sensing_config["max_candidates"]),
-            position_noise_std_m=float(local_sensing_config["local_position_noise_std_m"]),
+            measurement_position_std_m=np.asarray(local_sensing_config["measurement_position_std_m"], dtype=float),
+            measurement_velocity_std_mps=np.asarray(local_sensing_config["measurement_velocity_std_mps"], dtype=float),
             detection_probability=float(local_sensing_config["detection_probability"]),
             clutter_rate_per_second=float(local_sensing_config["clutter_rate_per_second"]),
             dt_seconds=self.dt,
+            relative_velocity_limit_mps=self.relative_velocity_limit_mps,
         )
         self.local_target_sensor = LocalTargetSensor(local_sensor_config, seed=self.seed)
 
-        self.agent_ids = build_agent_ids(self.mydrone_num)
         self.scene: ScenarioGroundTruth | None = None
         self.world: SwarmWorld | None = None
-        self.action_spaces: dict[str, Any] = {}
-        self.observation_spaces: dict[str, Any] = {}
-        self.global_state_space: Any | None = None
-        self.space_spec: SwarmSpaceSpec | None = None
-        self._previous_assigned_targets: np.ndarray | None = None
-        self._previous_assigned_distances: np.ndarray | None = None
         self._last_observations: dict[str, np.ndarray] | None = None
         self._last_observation_time_step: int | None = None
         self._last_local_observations: dict[str, LocalTargetObservation] | None = None
         self._last_local_observation_time_step: int | None = None
+        self._last_association_outputs: dict[str, MultiTargetTrackOutput] | None = None
+        self._last_association_time_step: int | None = None
+        self._last_local_track_sets: dict[str, LocalTrackSet] | None = None
+        self._last_local_track_set_time_step: int | None = None
+        self._last_fused_track_set: FusedTrackSet | None = None
+        self._last_fused_time_step: int | None = None
+        self._last_task_assignment: TaskAssignmentResult | None = None
+        self._last_task_assignment_time_step: int | None = None
+        self._previous_task_assignment: TaskAssignmentResult | None = None
+        self._bp_jpda_filter_states: dict[str, dict[int, BPJPDAFilterState]] = {}
+        self._gm_phd_filter_states: dict[str, GMPHDFilterState | None] = {}
+        self._lmb_filter_states: dict[str, dict[int, LMBFilterState]] = {}
+        self._delta_glmb_filter_states: dict[str, DeltaGLMBFilterState] = {}
         self._reset_count = 0
         self._episode_seed_rng = np.random.default_rng(seed)
 
@@ -206,14 +247,26 @@ class SwarmEnv:
         )
         self.world = SwarmWorld.from_scene(self.scene)
         self.world.reset()
-        self.global_key_target_sensor.reset(self.world.get_key_enemy_positions(), seed=episode_seed)
+        self.global_key_target_sensor.reset(seed=episode_seed)
         self.local_target_sensor.reset(seed=episode_seed)
         self._last_observations = None
         self._last_observation_time_step = None
         self._last_local_observations = None
         self._last_local_observation_time_step = None
-        self._build_spaces()
-        self._reset_tracking_memory()
+        self._last_association_outputs = None
+        self._last_association_time_step = None
+        self._last_local_track_sets = None
+        self._last_local_track_set_time_step = None
+        self._last_fused_track_set = None
+        self._last_fused_time_step = None
+        self._reset_task_assignment_cache()
+        self._previous_task_assignment = None
+        self._bp_jpda_filter_states = {agent_id: {} for agent_id in self.agent_ids}
+        self._gm_phd_filter_states = {agent_id: None for agent_id in self.agent_ids}
+        self._lmb_filter_states = {agent_id: {} for agent_id in self.agent_ids}
+        self._delta_glmb_filter_states = {
+            agent_id: DeltaGLMBFilterState(hypotheses=tuple()) for agent_id in self.agent_ids
+        }
 
         observations = self._build_observations()
         infos = {
@@ -224,8 +277,9 @@ class SwarmEnv:
                 "friendly_interference_watts": float(self.world.interference.friendly_received_watts[idx]),
                 "key_enemy_interference_dbm": self.world.interference.key_enemy_received_dbm.copy(),
                 "key_enemy_interference_watts": self.world.interference.key_enemy_received_watts.copy(),
-                "policy_input_mode": self.policy_input_mode,
+                "tracking_input_mode": self.tracking_input_mode,
                 "association_method": self.association_method,
+                "assignment_method": self.assignment_method,
                 "episode_seed": episode_seed,
             }
             for idx, agent_id in enumerate(self.agent_ids)
@@ -240,61 +294,11 @@ class SwarmEnv:
 
         ordered_actions = np.asarray([int(actions[agent_id]) for agent_id in self.agent_ids], dtype=int)
         result = self.world.step(friendly_actions=ordered_actions, dt=self.dt)
-        self.global_key_target_sensor.record_truth(self.world.get_key_enemy_positions())
 
         observations = self._build_observations()
-
-        # Strict interference reward: each friendly UAV receives its counterfactual
-        # marginal contribution to received jamming power at key targets.
-        # Non-key enemies remain in the scene as clutter, but they do not enter this simple
-        # baseline reward directly.
-        key_enemy_positions = self.world.get_key_enemy_positions()
-        pairwise_key_distances = self._pairwise_distances(result.friendly_positions, key_enemy_positions)
-        if self.reward_mode == "sustained_tracking":
-            assignment_components = compute_distance_assignment(pairwise_distances=pairwise_key_distances)
-            assigned_targets = assignment_components["assigned_target"].astype(int)
-            assigned_distances = assignment_components["assigned_distance"]
-            if self._previous_assigned_targets is None or self._previous_assigned_distances is None:
-                self._reset_tracking_memory()
-            assert self._previous_assigned_targets is not None
-            assert self._previous_assigned_distances is not None
-            pairwise_key_powers = self.world.interference.key_enemy_pairwise_watts
-            ally_interference_powers = result.friendly_interference_watts
-            tracking_rewards, assignment_components = compute_power_progress_rewards(
-                assigned_targets=assigned_targets,
-                assigned_distances=assigned_distances,
-                previous_assigned_targets=self._previous_assigned_targets,
-                previous_assigned_distances=self._previous_assigned_distances,
-                pairwise_jamming_powers=pairwise_key_powers,
-                ally_interference_powers=ally_interference_powers,
-                actions=ordered_actions,
-                J0=self.J0,
-                tau_ally=self.tau_ally,
-                lambda_safety=self.lambda_safety,
-                power_weight=self.power_weight,
-                progress_weight=self.progress_weight,
-                progress_distance_scale=self.progress_distance_scale,
-                move_penalty_weight=self.move_penalty_weight,
-            )
-            self._previous_assigned_targets = assigned_targets.copy()
-            self._previous_assigned_distances = assigned_distances.copy()
-            difference_rewards = np.zeros_like(tracking_rewards)
-        else:
-            difference_rewards = compute_difference_rewards(
-                pairwise_jamming_powers=self.world.interference.key_enemy_pairwise_watts,
-                ally_interference_powers=result.friendly_interference_watts,
-                tau_ally=self.tau_ally,
-                J0=self.J0,
-                lambda_safety=self.lambda_safety,
-            )
-            tracking_rewards = np.zeros_like(difference_rewards)
-            assignment_components = self._empty_assignment_components(
-                num_friendlies=len(self.agent_ids),
-                pairwise_key_distances=pairwise_key_distances,
-            )
-
-        total_rewards = difference_rewards + tracking_rewards
-        rewards = {agent_id: float(total_rewards[idx]) for idx, agent_id in enumerate(self.agent_ids)}
+        if self._last_task_assignment is not None:
+            self._previous_task_assignment = self._last_task_assignment
+        self._reset_task_assignment_cache()
 
         done = result.time_step >= self.max_steps
         terminated = {agent_id: done for agent_id in self.agent_ids}
@@ -308,25 +312,14 @@ class SwarmEnv:
                 "friendly_interference_watts": float(result.friendly_interference_watts[idx]),
                 "key_enemy_interference_dbm": result.key_enemy_interference_dbm.copy(),
                 "key_enemy_interference_watts": result.key_enemy_interference_watts.copy(),
-                "policy_input_mode": self.policy_input_mode,
+                "tracking_input_mode": self.tracking_input_mode,
                 "association_method": self.association_method,
-                "reward_mode": self.reward_mode,
-                "difference_reward": float(difference_rewards[idx]),
-                "tracking_reward": float(tracking_rewards[idx]),
-                "assigned_key_target": int(assignment_components["assigned_target"][idx]),
-                "assigned_key_distance": float(assignment_components["assigned_distance"][idx]),
-                "assigned_key_power": float(assignment_components["assigned_power"][idx]),
-                "power_reward": float(assignment_components["power_reward"][idx]),
-                "progress_reward": float(assignment_components["progress_reward"][idx]),
-                "move_penalty": float(assignment_components["move_penalty"][idx]),
-                "safety_penalty": float(assignment_components["safety_penalty"][idx]),
-                "team_reward": float(np.sum(total_rewards)),
+                "assignment_method": self.assignment_method,
             }
             for idx, agent_id in enumerate(self.agent_ids)
         }
         return EnvStepOutput(
             observations=observations,
-            rewards=rewards,
             terminated=terminated,
             truncated=truncated,
             infos=infos,
@@ -340,10 +333,6 @@ class SwarmEnv:
             return np.zeros((friendly_array.shape[0], key_array.shape[0]), dtype=float)
         return np.linalg.norm(friendly_array[:, None, :] - key_array[None, :, :], axis=-1)
 
-    def _reset_tracking_memory(self) -> None:
-        self._previous_assigned_targets = np.full(len(self.agent_ids), -1, dtype=int)
-        self._previous_assigned_distances = np.full(len(self.agent_ids), np.nan, dtype=float)
-
     def _next_episode_seed(self) -> int | None:
         if self.seed is None:
             return int(self._episode_seed_rng.integers(0, np.iinfo(np.int32).max))
@@ -351,129 +340,342 @@ class SwarmEnv:
         self._reset_count += 1
         return episode_seed
 
-    @staticmethod
-    def _empty_assignment_components(
-        num_friendlies: int,
-        pairwise_key_distances: np.ndarray,
-    ) -> dict[str, np.ndarray]:
-        nearest_distances = (
-            np.min(pairwise_key_distances, axis=1)
-            if pairwise_key_distances.shape[1]
-            else np.zeros(num_friendlies, dtype=float)
-        )
-        return {
-            "assigned_target": np.full(num_friendlies, -1.0, dtype=float),
-            "assigned_distance": nearest_distances.astype(float),
-            "assigned_power": np.zeros(num_friendlies, dtype=float),
-            "power_reward": np.zeros(num_friendlies, dtype=float),
-            "progress_reward": np.zeros(num_friendlies, dtype=float),
-            "move_penalty": np.zeros(num_friendlies, dtype=float),
-            "safety_penalty": np.zeros(num_friendlies, dtype=float),
-        }
-
-    def get_global_key_priors(self) -> np.ndarray:
-        """Return delayed/noisy key-target priors for the future association module."""
+    def get_global_key_priors(self) -> GlobalKeyTargetStatePrior:
+        """Return current noisy external key-target priors for local association."""
 
         if self.world is None:
             raise RuntimeError("reset() must be called before reading global key priors.")
         return self.global_key_target_sensor.observe(
             time_step=self.world.time_step,
-            dt=self.dt,
-            fallback_key_positions=self.world.get_key_enemy_positions(),
+            key_target_states=self.world.get_key_enemy_states(),
         )
 
-    def get_association_outputs(self) -> dict[str, AssociationOutput]:
-        """Return association outputs without feeding them to actor/critic."""
+    def get_association_outputs(self) -> dict[str, MultiTargetTrackOutput]:
+        """Return per-friendly multi-target local track posteriors for the current time step."""
 
         if self.world is None:
             raise RuntimeError("reset() must be called before reading association outputs.")
-        if self.policy_input_mode != "local_only":
-            return {agent_id: empty_association_output() for agent_id in self.agent_ids}
+        if self._last_association_time_step == self.world.time_step and self._last_association_outputs is not None:
+            return {agent_id: output for agent_id, output in self._last_association_outputs.items()}
+
+        if self.tracking_input_mode == "groundtruth":
+            outputs = self._build_groundtruth_track_outputs()
+            self._last_association_outputs = outputs
+            self._last_association_time_step = self.world.time_step
+            return {agent_id: output for agent_id, output in outputs.items()}
 
         local_observations = self._get_current_local_observations()
+        global_key_priors = self.get_global_key_priors()
+        friendly_states = self.world.get_friendly_states()
+
         if self.association_method == "none":
-            return nearest_local_candidate_association_for_friendlies(
+            outputs = nearest_local_candidate_association_for_friendlies(
+                friendly_states=friendly_states,
+                global_target_priors=global_key_priors,
                 local_observations=local_observations,
                 agent_ids=self.agent_ids,
             )
+            self._last_association_outputs = outputs
+            self._last_association_time_step = self.world.time_step
+            return {agent_id: output for agent_id, output in outputs.items()}
 
-        global_key_priors = self.get_global_key_priors()
-        if global_key_priors.size == 0:
-            return {agent_id: empty_association_output() for agent_id in self.agent_ids}
+        if global_key_priors.states.size == 0:
+            empty_outputs = {
+                agent_id: empty_multi_target_track_output(
+                    agent_id=agent_id,
+                    prior_relative_states=np.zeros((0, 6), dtype=float),
+                    prior_covariance_diagonal=global_key_priors.covariance_diagonal,
+                    mode=self.tracking_input_mode,
+                )
+                for agent_id in self.agent_ids
+            }
+            self._bp_jpda_filter_states = {agent_id: {} for agent_id in self.agent_ids}
+            self._gm_phd_filter_states = {agent_id: None for agent_id in self.agent_ids}
+            self._lmb_filter_states = {agent_id: {} for agent_id in self.agent_ids}
+            self._delta_glmb_filter_states = {
+                agent_id: DeltaGLMBFilterState(hypotheses=tuple()) for agent_id in self.agent_ids
+            }
+            self._last_association_outputs = empty_outputs
+            self._last_association_time_step = self.world.time_step
+            return {agent_id: output for agent_id, output in empty_outputs.items()}
 
-        friendly_positions = self.world.get_friendly_positions()
         if self.association_method == "bp_jpda":
-            return bp_jpda_association_for_friendlies(
-                friendly_positions=friendly_positions,
-                global_target_positions=global_key_priors,
+            outputs, next_filter_states = bp_jpda_association_for_friendlies(
+                friendly_states=friendly_states,
+                global_target_priors=global_key_priors,
                 local_observations=local_observations,
                 agent_ids=self.agent_ids,
+                previous_filter_states=self._bp_jpda_filter_states,
                 detection_radius_m=float(self.local_target_sensor.config.detection_radius_m),
-                local_position_noise_std_m=float(self.local_target_sensor.config.position_noise_std_m),
-                global_position_noise_std_m=float(self.global_key_target_sensor.config.position_noise_std_m),
-                prior_delay_seconds=float(self.global_key_target_sensor.config.radar_delay_seconds),
-                target_speed_std_mps=float(
-                    self.enemy_vmax if self.enemy_vmax is not None else get_enemy_vmax()
-                ),
+                relative_velocity_limit_mps=self.relative_velocity_limit_mps,
                 local_detection_probability=float(self.local_target_sensor.config.detection_probability),
                 clutter_rate_per_second=float(self.local_target_sensor.config.clutter_rate_per_second),
+                recursive_motion_model=self.recursive_motion_model,
+                imm_model_types=self.imm_model_types,
+                imm_model_transition_matrix=self.imm_model_transition_matrix,
+                imm_initial_model_probabilities=self.imm_initial_model_probabilities,
                 dt_seconds=float(self.local_target_sensor.config.dt_seconds),
                 gate_sigma=self.bp_jpda_gate_sigma,
                 max_iterations=self.bp_jpda_max_iterations,
                 convergence_tol=self.bp_jpda_convergence_tol,
                 min_missed_detection_probability=self.bp_jpda_min_missed_detection_probability,
+                survival_probability=self.gm_phd_survival_probability,
+                birth_weight=self.gm_phd_birth_weight,
+                process_position_std_m=self.gm_phd_process_position_std_m,
+                process_velocity_std_mps=self.gm_phd_process_velocity_std_mps,
+                imm_turn_rate_radps=self.imm_turn_rate_radps,
+                imm_ct_process_noise_scale=self.imm_ct_process_noise_scale,
+                confidence_threshold=self.gm_phd_confidence_threshold,
             )
+            self._bp_jpda_filter_states = next_filter_states
+            self._last_association_outputs = outputs
+            self._last_association_time_step = self.world.time_step
+            return {agent_id: output for agent_id, output in outputs.items()}
 
-        return nearest_neighbor_association_for_friendlies(
-            friendly_positions=friendly_positions,
-            global_target_positions=global_key_priors,
-            local_observations=local_observations,
-            agent_ids=self.agent_ids,
-            detection_radius_m=float(self.local_target_sensor.config.detection_radius_m),
+        if self.association_method == "gm_phd":
+            outputs, next_filter_states = gm_phd_association_for_friendlies(
+                friendly_states=friendly_states,
+                global_target_priors=global_key_priors,
+                local_observations=local_observations,
+                agent_ids=self.agent_ids,
+                previous_filter_states=self._gm_phd_filter_states,
+                detection_radius_m=float(self.local_target_sensor.config.detection_radius_m),
+                relative_velocity_limit_mps=self.relative_velocity_limit_mps,
+                local_detection_probability=float(self.local_target_sensor.config.detection_probability),
+                clutter_rate_per_second=float(self.local_target_sensor.config.clutter_rate_per_second),
+                recursive_motion_model=self.recursive_motion_model,
+                imm_model_types=self.imm_model_types,
+                imm_model_transition_matrix=self.imm_model_transition_matrix,
+                imm_initial_model_probabilities=self.imm_initial_model_probabilities,
+                dt_seconds=float(self.local_target_sensor.config.dt_seconds),
+                gate_sigma=self.bp_jpda_gate_sigma,
+                survival_probability=self.gm_phd_survival_probability,
+                birth_weight=self.gm_phd_birth_weight,
+                prune_threshold=self.gm_phd_prune_threshold,
+                merge_mahalanobis_threshold=self.gm_phd_merge_mahalanobis,
+                max_components=self.gm_phd_max_components,
+                process_position_std_m=self.gm_phd_process_position_std_m,
+                process_velocity_std_mps=self.gm_phd_process_velocity_std_mps,
+                imm_turn_rate_radps=self.imm_turn_rate_radps,
+                imm_ct_process_noise_scale=self.imm_ct_process_noise_scale,
+                confidence_threshold=self.gm_phd_confidence_threshold,
+            )
+            self._gm_phd_filter_states = next_filter_states
+            self._last_association_outputs = outputs
+            self._last_association_time_step = self.world.time_step
+            return {agent_id: output for agent_id, output in outputs.items()}
+
+        if self.association_method == "lmb":
+            outputs, next_filter_states = lmb_association_for_friendlies(
+                friendly_states=friendly_states,
+                global_target_priors=global_key_priors,
+                local_observations=local_observations,
+                agent_ids=self.agent_ids,
+                previous_filter_states=self._lmb_filter_states,
+                detection_radius_m=float(self.local_target_sensor.config.detection_radius_m),
+                relative_velocity_limit_mps=self.relative_velocity_limit_mps,
+                local_detection_probability=float(self.local_target_sensor.config.detection_probability),
+                clutter_rate_per_second=float(self.local_target_sensor.config.clutter_rate_per_second),
+                recursive_motion_model=self.recursive_motion_model,
+                imm_model_types=self.imm_model_types,
+                imm_model_transition_matrix=self.imm_model_transition_matrix,
+                imm_initial_model_probabilities=self.imm_initial_model_probabilities,
+                dt_seconds=float(self.local_target_sensor.config.dt_seconds),
+                gate_sigma=self.bp_jpda_gate_sigma,
+                max_iterations=self.bp_jpda_max_iterations,
+                convergence_tol=self.bp_jpda_convergence_tol,
+                survival_probability=self.gm_phd_survival_probability,
+                birth_weight=self.gm_phd_birth_weight,
+                process_position_std_m=self.gm_phd_process_position_std_m,
+                process_velocity_std_mps=self.gm_phd_process_velocity_std_mps,
+                imm_turn_rate_radps=self.imm_turn_rate_radps,
+                imm_ct_process_noise_scale=self.imm_ct_process_noise_scale,
+                confidence_threshold=self.gm_phd_confidence_threshold,
+            )
+            self._lmb_filter_states = next_filter_states
+            self._last_association_outputs = outputs
+            self._last_association_time_step = self.world.time_step
+            return {agent_id: output for agent_id, output in outputs.items()}
+
+        if self.association_method == "delta_glmb":
+            outputs, next_filter_states = delta_glmb_association_for_friendlies(
+                friendly_states=friendly_states,
+                global_target_priors=global_key_priors,
+                local_observations=local_observations,
+                agent_ids=self.agent_ids,
+                previous_filter_states=self._delta_glmb_filter_states,
+                detection_radius_m=float(self.local_target_sensor.config.detection_radius_m),
+                relative_velocity_limit_mps=self.relative_velocity_limit_mps,
+                local_detection_probability=float(self.local_target_sensor.config.detection_probability),
+                clutter_rate_per_second=float(self.local_target_sensor.config.clutter_rate_per_second),
+                recursive_motion_model=self.recursive_motion_model,
+                imm_model_types=self.imm_model_types,
+                imm_model_transition_matrix=self.imm_model_transition_matrix,
+                imm_initial_model_probabilities=self.imm_initial_model_probabilities,
+                dt_seconds=float(self.local_target_sensor.config.dt_seconds),
+                gate_sigma=self.bp_jpda_gate_sigma,
+                survival_probability=self.gm_phd_survival_probability,
+                birth_weight=self.gm_phd_birth_weight,
+                process_position_std_m=self.gm_phd_process_position_std_m,
+                process_velocity_std_mps=self.gm_phd_process_velocity_std_mps,
+                imm_turn_rate_radps=self.imm_turn_rate_radps,
+                imm_ct_process_noise_scale=self.imm_ct_process_noise_scale,
+                confidence_threshold=self.gm_phd_confidence_threshold,
+                max_hypotheses=self.delta_glmb_max_hypotheses,
+                hypothesis_weight_prune_threshold=self.delta_glmb_hypothesis_weight_prune_threshold,
+            )
+            self._delta_glmb_filter_states = next_filter_states
+            self._last_association_outputs = outputs
+            self._last_association_time_step = self.world.time_step
+            return {agent_id: output for agent_id, output in outputs.items()}
+
+        raise RuntimeError(
+            "Unsupported association_method reached after validation: "
+            f"{self.association_method!r}."
         )
 
-    def get_global_state(self) -> np.ndarray:
-        """Return the critic state for the configured policy-input mode."""
+    def get_track_posterior_outputs(self) -> dict[str, MultiTargetTrackOutput]:
+        """Alias exposing the current per-agent key-target posterior tracks."""
+
+        return self.get_association_outputs()
+
+    def get_local_track_sets(self) -> dict[str, LocalTrackSet]:
+        """Return per-agent local track summaries reported to the centralized fusion layer."""
 
         if self.world is None:
-            raise RuntimeError("reset() must be called before get_global_state().")
+            raise RuntimeError("reset() must be called before reading local track sets.")
+        if self._last_local_track_set_time_step == self.world.time_step and self._last_local_track_sets is not None:
+            return {agent_id: track_set for agent_id, track_set in self._last_local_track_sets.items()}
 
-        if self.policy_input_mode == "groundtruth":
-            bounds = np.asarray(self.world.bounds, dtype=float)
-            enemy_positions = (self.world.get_key_enemy_positions() / bounds).reshape(-1)
-            friendly_positions = (self.world.get_friendly_positions() / bounds).reshape(-1)
-            key_enemy_interference_dbm = self.world.interference.key_enemy_received_dbm.reshape(-1)
-            friendly_interference_dbm = self.world.interference.friendly_received_dbm.reshape(-1)
-            return np.concatenate(
-                [enemy_positions, friendly_positions, key_enemy_interference_dbm, friendly_interference_dbm],
-                dtype=np.float32,
-            )
+        local_track_sets = build_local_track_sets(
+            timestamp=self.world.time_step,
+            track_outputs=self.get_association_outputs(),
+            agent_ids=self.agent_ids,
+        )
+        self._last_local_track_sets = local_track_sets
+        self._last_local_track_set_time_step = self.world.time_step
+        return {agent_id: track_set for agent_id, track_set in local_track_sets.items()}
 
-        if self._last_observation_time_step != self.world.time_step or self._last_observations is None:
-            self._build_observations()
-        assert self._last_observations is not None
-        ordered_obs = [self._last_observations[agent_id] for agent_id in self.agent_ids]
-        return np.concatenate(ordered_obs, dtype=np.float32)
+    def get_fused_track_set(self) -> FusedTrackSet:
+        """Return the centralized fused key-track set in the global frame."""
+
+        if self.world is None:
+            raise RuntimeError("reset() must be called before reading fused tracks.")
+        if self._last_fused_time_step == self.world.time_step and self._last_fused_track_set is not None:
+            return self._last_fused_track_set
+
+        fused_track_set = self.fusion_center.fuse(
+            timestamp=self.world.time_step,
+            local_track_sets=self.get_local_track_sets(),
+            friendly_states=self.world.get_friendly_states(),
+            agent_ids=self.agent_ids,
+        )
+        self._last_fused_track_set = fused_track_set
+        self._last_fused_time_step = self.world.time_step
+        return fused_track_set
 
     def get_local_observations(self) -> dict[str, LocalTargetObservation]:
-        """Return fixed-length local target observations for each friendly UAV.
-
-        These anonymous local candidates are the only target observations currently fed
-        to actor observations and critic state.
-        """
+        """Return fixed-length local measurement sets for each friendly UAV."""
 
         if self.world is None:
             raise RuntimeError("reset() must be called before get_local_observations().")
 
-        enemy_positions = self.world.get_enemy_positions()
-        friendly_positions = self.world.get_friendly_positions()
+        enemy_states = self.world.get_enemy_states()
+        friendly_states = self.world.get_friendly_states()
         return {
             agent_id: self.local_target_sensor.observe(
-                friendly_position=friendly_positions[idx],
-                target_positions=enemy_positions,
+                friendly_state=friendly_states[idx],
+                target_states=enemy_states,
             )
             for idx, agent_id in enumerate(self.agent_ids)
         }
+
+    def build_task_assignment(self) -> TaskAssignmentResult:
+        """Build downstream key-track assignments using the configured assignment method."""
+
+        if self.world is None:
+            raise RuntimeError("reset() must be called before building task assignments.")
+        if (
+            self._last_task_assignment is not None
+            and self._last_task_assignment_time_step == self.world.time_step
+        ):
+            return self._last_task_assignment
+        if self.assignment_method == "placeholder":
+            assignment = build_empty_task_assignment(self.agent_ids, timestamp=self.world.time_step)
+            self._last_task_assignment = assignment
+            self._last_task_assignment_time_step = self.world.time_step
+            return assignment
+        if self.assignment_method == "hungarian":
+            assignment = build_hungarian_task_assignment(
+                self.agent_ids,
+                timestamp=self.world.time_step,
+                friendly_states=self.world.get_friendly_states(),
+                fused_track_set=self.get_fused_track_set(),
+                prediction_dt=self.dt,
+                switch_penalty=self.friendly_vmax * self.dt,
+                previous_assignment=self._previous_task_assignment,
+            )
+            self._last_task_assignment = assignment
+            self._last_task_assignment_time_step = self.world.time_step
+            return assignment
+        raise RuntimeError(
+            "Unsupported assignment_method reached after validation: "
+            f"{self.assignment_method!r}."
+        )
+
+    def build_task_assignment_placeholder(self) -> TaskAssignmentResult:
+        """Backward-compatible alias that now respects the configured assignment method."""
+
+        return self.build_task_assignment()
+
+    def build_control_command_placeholder(
+        self,
+        assignment: TaskAssignmentResult | None = None,
+    ) -> dict[str, ControlCommand]:
+        """Backward-compatible alias that now performs simple pursuit control when assigned."""
+
+        if self.world is None:
+            raise RuntimeError("reset() must be called before building control commands.")
+        if assignment is not None:
+            return self.build_control_commands(assignment=assignment)
+        return build_placeholder_control_commands(self.agent_ids, stop_action=0)
+
+    def build_control_commands(
+        self,
+        assignment: TaskAssignmentResult | None = None,
+    ) -> dict[str, ControlCommand]:
+        """Build simple control commands that pursue the assigned fused target state."""
+
+        if self.world is None:
+            raise RuntimeError("reset() must be called before building control commands.")
+        if assignment is None:
+            assignment = self.build_task_assignment()
+        commands = build_tracking_control_commands(
+            self.agent_ids,
+            friendly_states=self.world.get_friendly_states(),
+            assignment=assignment,
+            fused_track_set=self.get_fused_track_set(),
+            stop_action=0,
+        )
+        return commands
+
+    def plan_tracking_actions_placeholder(
+        self,
+        assignment: TaskAssignmentResult | None = None,
+    ) -> dict[str, int]:
+        """Backward-compatible alias returning pursuit actions from the configured assignment."""
+
+        commands = self.build_control_commands(assignment=assignment)
+        return extract_actions(commands)
+
+    def plan_tracking_actions(
+        self,
+        assignment: TaskAssignmentResult | None = None,
+    ) -> dict[str, int]:
+        """Return discrete actions that pursue the assigned fused key-track."""
+
+        commands = self.build_control_commands(assignment=assignment)
+        return extract_actions(commands)
 
     def _get_current_local_observations(self) -> dict[str, LocalTargetObservation]:
         if self.world is None:
@@ -487,134 +689,67 @@ class SwarmEnv:
         self._last_local_observation_time_step = self.world.time_step
         return self._last_local_observations
 
-    def _build_spaces(self) -> None:
-        if self.world is None or not self.world.friendly_uavs:
-            return
+    def _build_groundtruth_track_outputs(self) -> dict[str, MultiTargetTrackOutput]:
+        if self.world is None:
+            raise RuntimeError("reset() must be called before building groundtruth track outputs.")
 
-        action_dim = self.world.friendly_uavs[0].action_dim
-        num_enemies = len(self.world.enemy_nodes)
-        num_friendlies = len(self.world.friendly_uavs)
-        num_key_enemies = len(self.world.get_key_enemy_nodes())
-        max_local_candidates = int(self.local_target_sensor.config.max_candidates)
-        self.space_spec = build_space_spec(
-            num_friendlies,
-            num_enemies,
-            num_key_enemies,
-            max_local_candidates,
-            action_dim,
-            self.policy_input_mode,
-        )
-        self.action_spaces = build_action_spaces(num_friendlies, action_dim)
-        self.observation_spaces = build_observation_spaces(
-            num_friendlies,
-            num_enemies,
-            num_key_enemies,
-            max_local_candidates,
-            self.world.bounds,
-            self.policy_input_mode,
-        )
-        self.global_state_space = build_global_state_space(
-            num_friendlies,
-            num_enemies,
-            num_key_enemies,
-            max_local_candidates,
-            self.world.bounds,
-            self.policy_input_mode,
-        )
+        friendly_states = self.world.get_friendly_states()
+        key_enemy_states = self.world.get_key_enemy_states()
+        prior_covariance = np.full(STATE_DIM, 1.0e-6, dtype=np.float32)
+        outputs: dict[str, MultiTargetTrackOutput] = {}
+        for friendly_idx, agent_id in enumerate(self.agent_ids):
+            if key_enemy_states.size == 0:
+                outputs[agent_id] = empty_multi_target_track_output(
+                    agent_id=agent_id,
+                    prior_relative_states=np.zeros((0, STATE_DIM), dtype=float),
+                    prior_covariance_diagonal=prior_covariance,
+                    mode="groundtruth",
+                )
+                continue
+            relative_truth = key_enemy_states - friendly_states[friendly_idx].reshape(1, STATE_DIM)
+            tracks = tuple(
+                KeyTrackPosterior(
+                    global_target_index=target_idx,
+                    prior_relative_state=relative_truth[target_idx].astype(np.float32),
+                    prior_covariance_diagonal=prior_covariance.copy(),
+                    posterior_relative_state=relative_truth[target_idx].astype(np.float32),
+                    posterior_covariance_diagonal=prior_covariance.copy(),
+                    confidence=1.0,
+                    existence_probability=1.0,
+                    valid=True,
+                    local_candidate_weights=None,
+                    local_candidate_index=-1,
+                    innovation_distance=0.0,
+                )
+                for target_idx in range(relative_truth.shape[0])
+            )
+            outputs[agent_id] = MultiTargetTrackOutput(
+                agent_id=agent_id,
+                tracks=tracks,
+                mode="groundtruth",
+            )
+        return outputs
 
     def _build_observations(self) -> dict[str, np.ndarray]:
         if self.world is None:
             raise RuntimeError("reset() must be called before building observations.")
-
-        if self.policy_input_mode == "groundtruth":
-            return self._build_groundtruth_observations()
-        return self._build_local_only_observations()
-
-    def _build_local_only_observations(self) -> dict[str, np.ndarray]:
-        if self.world is None:
-            raise RuntimeError("reset() must be called before building observations.")
-
-        local_observations = self._get_current_local_observations()
         association_outputs = self.get_association_outputs()
-        friendly_positions = self.world.get_friendly_positions()
+        friendly_states = self.world.get_friendly_states()
         bounds = np.asarray(self.world.bounds, dtype=float)
-        max_local_candidates = int(self.local_target_sensor.config.max_candidates)
+        self_state_scale = np.concatenate(
+            [bounds, np.full(3, max(self.friendly_vmax, 1.0e-6), dtype=float)]
+        )
+
         observations: dict[str, np.ndarray] = {}
         for idx, agent_id in enumerate(self.agent_ids):
-            self_position = friendly_positions[idx]
-            self_position_normalized = self_position / bounds
-            local_observation = local_observations[agent_id]
-            local_relative = local_observation.relative_positions / bounds
-            association_weights = association_output_to_weight_vector(
-                association_outputs[agent_id],
-                max_local_candidates=max_local_candidates,
-            )
-            observation = np.concatenate(
-                [
-                    self_position_normalized,
-                    local_relative.reshape(-1),
-                    local_observation.mask,
-                    association_weights,
-                ]
-            ).astype(np.float32)
+            self_state = friendly_states[idx]
+            track_features = flatten_track_output(association_outputs[agent_id])
+            observation = np.concatenate([self_state / self_state_scale, track_features]).astype(np.float32)
             observations[agent_id] = observation
         self._last_observations = {agent_id: obs.copy() for agent_id, obs in observations.items()}
         self._last_observation_time_step = self.world.time_step
         return observations
 
-    def _build_groundtruth_observations(self) -> dict[str, np.ndarray]:
-        if self.world is None:
-            raise RuntimeError("reset() must be called before building observations.")
-
-        enemy_positions, enemy_is_key = build_policy_enemy_view(
-            enemy_positions=self.world.get_enemy_positions(),
-            enemy_roles=[node.role for node in self.world.enemy_nodes],
-            key_target_positions=self.world.get_key_enemy_positions(),
-            include_non_key=False,
-        )
-        key_enemy_positions = self.world.get_key_enemy_positions()
-        friendly_positions = self.world.get_friendly_positions()
-        bounds = np.asarray(self.world.bounds, dtype=float)
-        distance_norm = float(np.linalg.norm(bounds))
-        pairwise_key_distances = self._pairwise_distances(friendly_positions, key_enemy_positions)
-        assigned_key_targets = (
-            compute_distance_assignment(pairwise_distances=pairwise_key_distances)["assigned_target"].astype(int)
-            if key_enemy_positions.size
-            else np.zeros(0, dtype=int)
-        )
-        observations: dict[str, np.ndarray] = {}
-        for idx, agent_id in enumerate(self.agent_ids):
-            self_position = friendly_positions[idx]
-            self_position_normalized = self_position / bounds
-            enemy_position_features = enemy_positions / bounds
-            enemy_features = np.column_stack([enemy_position_features, enemy_is_key]).reshape(-1)
-            key_distances = (
-                np.linalg.norm(key_enemy_positions - self_position, axis=1) / distance_norm
-                if key_enemy_positions.size
-                else np.zeros(0, dtype=float)
-            )
-            if key_enemy_positions.size:
-                assigned_key_idx = int(assigned_key_targets[idx])
-                assigned_key_relative = (key_enemy_positions[assigned_key_idx] - self_position) / bounds
-                assigned_key_distance = np.asarray([key_distances[assigned_key_idx]], dtype=float)
-                assigned_key_one_hot = np.zeros(key_enemy_positions.shape[0], dtype=float)
-                assigned_key_one_hot[assigned_key_idx] = 1.0
-                assigned_key_features = np.concatenate(
-                    [assigned_key_relative, assigned_key_distance, assigned_key_one_hot]
-                )
-            else:
-                assigned_key_features = np.zeros(0, dtype=float)
-            friendly_relative = ((friendly_positions - self_position) / bounds).reshape(-1)
-            observation = np.concatenate(
-                [
-                    self_position_normalized,
-                    enemy_features,
-                    key_distances,
-                    assigned_key_features,
-                    friendly_relative,
-                ]
-            ).astype(np.float32)
-            observations[agent_id] = observation
-        self._last_observations = {agent_id: obs.copy() for agent_id, obs in observations.items()}
-        self._last_observation_time_step = self.world.time_step
-        return observations
+    def _reset_task_assignment_cache(self) -> None:
+        self._last_task_assignment = None
+        self._last_task_assignment_time_step = None

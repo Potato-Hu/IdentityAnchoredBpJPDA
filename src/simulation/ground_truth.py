@@ -12,6 +12,7 @@ from src.utils.config_loader import (
     get_enemy_mobility_config,
     get_enemy_vmax,
     get_friendly_vmax,
+    get_initialization_config,
     should_print_initial_positions,
 )
 
@@ -159,6 +160,92 @@ def _sample_near_anchors(
     return positions
 
 
+def _sample_random_positions_with_min_separation(
+    count: int,
+    bounds: np.ndarray,
+    rng: np.random.Generator,
+    *,
+    min_separation: float,
+) -> np.ndarray:
+    if count == 0:
+        return np.zeros((0, 3), dtype=float)
+    if min_separation <= 0.0:
+        return _random_positions(count, bounds, rng)
+
+    positions: list[np.ndarray] = []
+    for _ in range(count):
+        for _ in range(4096):
+            candidate = rng.uniform(low=np.zeros(3, dtype=float), high=bounds, size=3)
+            if not positions:
+                positions.append(candidate.astype(float))
+                break
+            distances = np.linalg.norm(np.asarray(positions, dtype=float) - candidate.reshape(1, 3), axis=1)
+            if np.all(distances >= float(min_separation)):
+                positions.append(candidate.astype(float))
+                break
+        else:
+            raise ValueError(
+                "Unable to sample friendly UAV initial positions with minimum separation "
+                f"{min_separation:.3f} inside bounds {bounds.tolist()}."
+            )
+    return np.asarray(positions, dtype=float)
+
+
+def _sample_overlapping_friendlies_near_keys(
+    key_positions: np.ndarray,
+    count: int,
+    bounds: np.ndarray,
+    rng: np.random.Generator,
+    *,
+    distance_limits: Sequence[float] | None = None,
+    min_separation: float = 0.0,
+) -> np.ndarray:
+    """Sample friendly UAVs near the key-target cluster so their local views overlap."""
+
+    if count == 0:
+        return np.zeros((0, 3), dtype=float)
+    if key_positions.shape[0] == 0:
+        return _sample_random_positions_with_min_separation(
+            count,
+            bounds,
+            rng,
+            min_separation=min_separation,
+        )
+
+    min_distance, max_distance = _nearby_distance_limits(bounds, distance_limits)
+    cluster_center = np.mean(np.asarray(key_positions, dtype=float), axis=0)
+    shared_anchor = np.clip(cluster_center, np.zeros(3, dtype=float), bounds)
+    minimum_separation = max(float(min_separation), 0.0)
+
+    friendly_positions: list[np.ndarray] = []
+    for _ in range(count):
+        for _ in range(4096):
+            candidate = _sample_near_anchor(
+                anchor=shared_anchor,
+                bounds=bounds,
+                rng=rng,
+                min_distance=min_distance,
+                max_distance=max_distance,
+            )
+            if minimum_separation <= 0.0 or not friendly_positions:
+                friendly_positions.append(candidate.astype(float))
+                break
+            distances = np.linalg.norm(
+                np.asarray(friendly_positions, dtype=float) - candidate.reshape(1, 3),
+                axis=1,
+            )
+            if np.all(distances >= minimum_separation):
+                friendly_positions.append(candidate.astype(float))
+                break
+        else:
+            raise ValueError(
+                "Unable to sample friendly UAV initial positions near the key-target cluster "
+                f"with minimum separation {minimum_separation:.3f} and distance limits "
+                f"[{min_distance:.3f}, {max_distance:.3f}]."
+            )
+    return np.asarray(friendly_positions, dtype=float)
+
+
 def _sample_near_anchors_with_indices(
     anchors: np.ndarray,
     count: int,
@@ -263,7 +350,8 @@ def assign_initial_positions(
 
     scene_bounds = _as_bounds(bounds)
     manual_positions = dict(initial_positions or {})
-    configured_distance_limits = dict(nearby_distance_limits or {})
+    configured_distance_limits = dict(get_initialization_config())
+    configured_distance_limits.update(dict(nearby_distance_limits or {}))
     position_rng = rng if rng is not None else np.random.default_rng()
 
     key_positions = (
@@ -286,13 +374,13 @@ def assign_initial_positions(
     friendly_positions = (
         _validate_positions("friend_drone", manual_positions["friend_drone"], mydrone_num, scene_bounds)
         if manual_positions.get("friend_drone") is not None
-        else _sample_near_anchors(
+        else _sample_overlapping_friendlies_near_keys(
             key_positions,
             mydrone_num,
             scene_bounds,
             position_rng,
-            entity_name="friend_drone",
             distance_limits=configured_distance_limits.get("friend_drone"),
+            min_separation=float(configured_distance_limits.get("friend_drone_min_separation_m", 0.0)),
         )
     )
 

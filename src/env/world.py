@@ -94,10 +94,30 @@ class SwarmWorld:
             return np.zeros((0, 3), dtype=float)
         return np.asarray([node.coords.copy() for node in self.enemy_nodes], dtype=float)
 
+    def get_enemy_velocities(self) -> np.ndarray:
+        if not self.enemy_nodes:
+            return np.zeros((0, 3), dtype=float)
+        return np.asarray([node.velocity_vector.copy() for node in self.enemy_nodes], dtype=float)
+
+    def get_enemy_states(self) -> np.ndarray:
+        if not self.enemy_nodes:
+            return np.zeros((0, 6), dtype=float)
+        return np.concatenate([self.get_enemy_positions(), self.get_enemy_velocities()], axis=1)
+
     def get_friendly_positions(self) -> np.ndarray:
         if not self.friendly_uavs:
             return np.zeros((0, 3), dtype=float)
         return np.asarray([uav.coords.copy() for uav in self.friendly_uavs], dtype=float)
+
+    def get_friendly_velocities(self) -> np.ndarray:
+        if not self.friendly_uavs:
+            return np.zeros((0, 3), dtype=float)
+        return np.asarray([uav.velocity_vector.copy() for uav in self.friendly_uavs], dtype=float)
+
+    def get_friendly_states(self) -> np.ndarray:
+        if not self.friendly_uavs:
+            return np.zeros((0, 6), dtype=float)
+        return np.concatenate([self.get_friendly_positions(), self.get_friendly_velocities()], axis=1)
 
     def get_key_enemy_nodes(self) -> list[EnemyNode]:
         return [node for node in self.enemy_nodes if node.role == "key"]
@@ -107,6 +127,17 @@ class SwarmWorld:
         if not key_nodes:
             return np.zeros((0, 3), dtype=float)
         return np.asarray([node.coords.copy() for node in key_nodes], dtype=float)
+
+    def get_key_enemy_velocities(self) -> np.ndarray:
+        key_nodes = self.get_key_enemy_nodes()
+        if not key_nodes:
+            return np.zeros((0, 3), dtype=float)
+        return np.asarray([node.velocity_vector.copy() for node in key_nodes], dtype=float)
+
+    def get_key_enemy_states(self) -> np.ndarray:
+        if not self.get_key_enemy_nodes():
+            return np.zeros((0, 6), dtype=float)
+        return np.concatenate([self.get_key_enemy_positions(), self.get_key_enemy_velocities()], axis=1)
 
     def snapshot(self) -> dict[str, np.ndarray | float | int]:
         """Return the current world state as plain arrays."""

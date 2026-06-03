@@ -2,214 +2,206 @@
 
 ## 1. Task Definition
 
-The current project formulates the problem as a **cooperative multi-agent reinforcement learning** task for multiple friendly UAVs.
+The project is formulated as a **centralized-fusion key-target multi-target tracking** problem rather than a multi-agent reinforcement learning task.
 
-The practical objective of the current implementation is:
+The practical objective is:
 
-> Learn cooperative motion policies that improve effective jamming on key enemies while maintaining safe behavior under partial local observations and uncertain target association.
+> Maintain accurate, continuous, and identity-consistent estimates of multiple key targets when each friendly UAV only observes noisy local anonymous candidates and non-key targets create clutter and association ambiguity.
 
-This wording matches the current code better than the earlier formulation, because the present baseline is centered on:
+The intended formulation emphasizes:
 
-- partial observability
-- local candidate sensing
-- key-target-focused reward
-- optional global-to-local association assistance
+- weak external priors on key targets
+- local anonymous observations at each friendly UAV
+- key-target-priority-aware association
+- learned scoring for classical association backends
+- centralized fusion of per-UAV local track summaries
+- key-target-oriented evaluation metrics
 
 ---
 
-## 2. Observation, State, and Action
+## 2. Core Assumptions
 
-### 2.1 Per-Agent Observation
+### 2.1 Target Types
 
-In the default `local_only` mode, each UAV observes:
+The environment contains:
 
-- its own normalized position
-- relative positions of a fixed number of local target candidates
-- a binary mask for valid candidate slots
-- association weights aligned with those local candidate slots
+- `key targets`: the targets we care about maintaining
+- `non-key targets`: distractors that may move near key targets and generate association confusion
 
-So the observation is not:
+The task is not to estimate all targets equally well. It is to **preferentially protect the quality of the key-target tracks**.
 
-- direct global radar observation
-- explicit enemy identity
-- explicit key/non-key labels
-- clean fused target tracks
+### 2.2 Weak External Key Priors
 
-Instead, the policy must act from a partially observed local candidate set.
-
-### 2.2 Global Information Usage
-
-Delayed noisy global sensing of key enemies is available in the environment, but in the current implementation it is used only to support association.
-
-That means:
-
-- global sensing helps infer which local candidates may correspond to key targets
-- global sensing is **not** directly fed into the actor in the default training mode
-
-### 2.3 Critic State
-
-The project uses a centralized critic.
-
-Current critic-state construction depends on `policy_input.mode`:
-
-- `local_only`: critic state is the concatenation of all agents' policy observations
-- `groundtruth`: critic state uses debug-friendly world-truth target/friendly features and interference statistics
-
-Therefore, the critic is centralized, but the main baseline does **not** assume full global truth during normal training.
-
-### 2.4 Action Space
-
-The implemented action for UAV `i` is a discrete motion command:
+An external sensing source provides weak 6D priors for key targets:
 
 $$
-a_i \in \mathcal{A}_{move}
+\hat{x}^{prior}_k(t) = x_k(t) + \epsilon_k(t)
 $$
 
-where `\mathcal{A}_{move}` contains:
+where the covariance of `\epsilon_k(t)` is intentionally large enough that the prior serves only as coarse guidance.
 
-- one stop action
+These priors are used to:
+
+- initialize key-track hypotheses
+- support local association
+- stabilize key-target identity over time
+
+They are not treated as exact ground truth and should not directly solve target assignment for each UAV.
+
+### 2.3 Local Anonymous Observations
+
+Each friendly UAV `i` receives only a local observation set
+
+$$
+Z_i(t) = \{z_i^1(t), z_i^2(t), \dots, z_i^{m_i}(t)\}
+$$
+
+with the following properties:
+
+- candidates are anonymous
+- observations are noisy
+- detections may be missed
+- clutter / false alarms may appear
+- candidates may come from either key or non-key targets
+
+Therefore, the task is partially observed at the sensor level even though the final objective is estimation rather than policy learning.
+
+### 2.4 Central Fusion Assumption
+
+Friendly UAVs do not exchange raw local measurements in the target formulation. Instead, each UAV exposes only its **local key-track summary** to an ideal centralized controller.
+
+The centralized fusion layer therefore solves:
+
+- which local tracks from different UAVs correspond to the same key target
+- how to fuse inconsistent local estimates
+- how to maintain key-target identity consistency across UAVs
+
+The repository intentionally does **not** model a communication stack here. There is no packet protocol, bandwidth constraint, asynchronous delivery, or wireless-link simulation in the current scope. The abstraction is simply that all local track summaries are available to the fusion center each step.
+
+### 2.5 Motion and Action Space
+
+Friendly UAVs still use the existing discrete 3D motion action space:
+
+- one `stop` action
 - 26 normalized 3D movement directions
 
-The action updates the UAV velocity direction at fixed magnitude determined by friendly `vmax`.
-
-The current training pipeline does **not** optimize transmit power allocation as a separate action.
+This action space is retained for later task-assignment and tracking-control modules, but policy learning is not the primary focus of the current formulation.
 
 ---
 
-## 3. Association-Aware Partial Observation Formulation
+## 3. Estimation and Fusion Structure
 
-The current training formulation is best described as:
+The problem is decomposed into three layers.
 
-1. the world contains key and non-key enemies
-2. each UAV receives anonymous local candidate measurements
-3. delayed/noisy global key priors may be matched to those local candidates
-4. the policy consumes the local candidates plus an association-derived weight vector
+### 3.1 Local Association and State Estimation
 
-This can be written conceptually as:
+Each UAV maintains local key-track hypotheses and updates them from:
 
-$$
-o_i(t) = \phi\Big(x_i(t),\ \mathcal{Z}^{local}_i(t),\ m_i(t),\ w_i(t)\Big)
-$$
+- weak external key priors
+- previous local track predictions
+- current local anonymous candidate observations
 
-where:
+The main baseline algorithms belong here, such as:
 
-- `x_i(t)` is friendly UAV self state used in the observation
-- `\mathcal{Z}^{local}_i(t)` is the fixed-length local candidate set
-- `m_i(t)` is the candidate validity mask
-- `w_i(t)` is the association weight vector
+- nearest-neighbor style association
+- JPDA-style association
+- GM-PHD-style recursive estimation
 
-This is the key modeling choice in the current codebase.
+For recursive local-track maintenance, the repository now supports two motion-prior settings:
 
----
+- `cv`: a single constant-velocity model
+- `imm`: an interacting multiple-model predictor that defaults to a bank of `cv`, `ca`, `ct_left`, and `ct_right`
 
-## 4. Reward Function
+This local recursive motion prior is an estimator-side approximation. It should be interpreted separately from the
+ground-truth scene mobility, which may remain more maneuvering or partially mismatched.
 
-The earlier simplified reward description
+The research direction of interest is **priority-aware association**, where key-target continuity and identity preservation influence association strength.
 
-$$
-r = R_{key} - R_{nonkey} - R_{friendly}
-$$
+More specifically, the intended novelty is not an end-to-end replacement of Bayesian tracking. The target direction is a
+**learned association-scoring layer** that consumes weak priors, local anonymous candidates, previous track state, and
+uncertainty, then outputs:
 
-is no longer an accurate description of the implemented baseline.
+- track-candidate association scores
+- missed-detection probability corrections
+- existence-probability corrections
 
-The current code supports two concrete reward modes.
+These learned quantities are then used inside a classical recursive backend such as `JPDA` or `LMB`.
 
-### 4.1 Difference Reward
+### 3.2 Centralized Track Fusion
 
-For each agent, the environment computes:
+Each UAV exports local key-track summaries instead of raw measurements. A central controller then associates and fuses these summaries across UAVs.
 
-- global key-target jamming utility
-- the counterfactual utility with that agent removed
-- a friendly safety penalty
+The research direction of interest is **collaborative key-target tracking with centralized fusion**, where multiple UAVs cooperate through:
 
-Conceptually:
+- local track maintenance
+- per-UAV summary reporting to the fusion center
+- track-to-track association
+- centralized fusion
 
-$$
-r_i^{diff} = \Big(U(J) - U(J^{-i})\Big) - \lambda_{safe} \cdot \max(0, I_i^{ally} - \tau_{ally})
-$$
+### 3.3 Task Assignment and Control
 
-with:
+After fused key-target tracks are available, a downstream module can:
 
-$$
-U(J) = \frac{1}{N_k}\sum_k \log\left(1 + \frac{J_k}{J_0}\right)
-$$
+- assign key targets to UAVs
+- choose motion actions that preserve or improve future tracking quality
 
-This reward directly emphasizes marginal contribution to key-target suppression.
-
-### 4.2 Sustained Tracking Reward
-
-The alternative reward mode first assigns each friendly UAV to a key target, then combines:
-
-- assigned-target power reward
-- distance progress reward toward the assigned target
-- movement penalty
-- friendly safety penalty
-
-Conceptually:
-
-$$
-r_i^{track} =
-\alpha \log\left(1 + \frac{J_{i,\pi(i)}}{J_0}\right)
-+ \beta \cdot \text{progress}_i
-- \lambda_{move}\cdot \text{move}_i
-- \lambda_{safe}\cdot \text{safety}_i
-$$
-
-where `\pi(i)` is the current assigned key target.
-
-### 4.3 What Is Not Yet in the Reward
-
-In the current implementation:
-
-- non-key enemies are not directly penalized in the reward
-- the reward is mainly built around key-target utility and ally safety
-
-So non-key enemies currently matter more through **observation clutter and association difficulty** than through an explicit reward penalty term.
+These modules are currently placeholders in the revised architecture and are not yet the source of algorithmic novelty.
 
 ---
 
-## 5. Policy Optimization
+## 4. Outputs of Interest
 
-The project uses MAPPO with:
+The estimation stack should output a **set of key-target posterior tracks** rather than a single per-agent target estimate.
 
-- decentralized actor
-- centralized critic
-- shared policy across agents
+Each key-target track should provide at least:
 
-The training objective remains the standard discounted return maximization:
+- state mean
+- state covariance
+- existence / confidence score
+- key label or key-target identity hypothesis
+- continuity / identity-consistency metadata
 
-$$
-\max_\theta \mathbb{E}\left[\sum_t \gamma^t r_t\right]
-$$
+These outputs are the natural inputs to:
 
-But the practical implementation is specifically designed around:
-
-- partial local observations
-- centralized training with stacked agent observations
-- optional association guidance
+- centralized fusion
+- downstream task assignment
+- downstream motion control
 
 ---
 
-## 6. Main Challenges Reflected by the Current Code
+## 5. Evaluation Metrics
 
-1. **Partial observability**: each UAV only sees local anonymous candidates.
-2. **Association uncertainty**: key-target priors are delayed/noisy and must be matched to local candidates.
-3. **Clutter robustness**: non-key enemies and false alarms contaminate local sensing.
-4. **Cooperative coordination**: multiple UAVs must avoid redundant behavior and improve total key-target suppression.
-5. **Safety trade-off**: stronger jamming contribution must be balanced against friendly interference penalties.
+The primary evaluation metrics are:
+
+- `key-target OSPA`
+- `key-target RMSE`
+
+Recommended secondary diagnostics are:
+
+- key-target track continuity
+- key-target identity-switch count
+- key-target fragmentation count
+
+The current repository already supports `key-target RMSE` and `key-target OSPA`. For the proposed learned-association
+direction, the identity-switch and fragmentation diagnostics should be elevated from optional reporting to primary
+evaluation quantities.
+
+The metrics are intentionally key-target-centric rather than symmetric over all targets.
 
 ---
 
-## 7. Current Formulation Summary
+## 6. Summary
 
-The current project is more accurately summarized as:
+The project is best described as:
 
-- a **key-target-oriented cooperative MAPPO baseline**
-- trained primarily from **local anonymous observations**
-- optionally assisted by **association between global key priors and local candidates**
-- evaluated with rewards based on **key-target jamming utility** and **friendly safety**
+- a **key-target-oriented multi-target tracking problem with centralized fusion**
+- with **weak external key priors**
+- under **local anonymous partial observations**
+- in the presence of **non-key distractor targets**
+- solved through **local association, local track maintenance, and centralized track fusion**
+- and improved through **learned scoring layered onto classical association backends**
 
-This is different from the original conceptual formulation in two important ways:
+This differs from the earlier MAPPO-centered formulation in two important ways:
 
-1. training does not directly rely on global observations in the default setting
-2. reward design is currently focused on key-target effectiveness rather than a full explicit key/non-key/friendly decomposition
+1. the core problem is estimation and fusion, not policy optimization
+2. the main outputs are multi-key-target track posteriors, not per-agent RL observations

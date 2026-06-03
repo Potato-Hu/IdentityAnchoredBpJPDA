@@ -1,0 +1,149 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Literal
+import numpy as np
+
+STATE_DIM = 6  # [x, y, z, vx, vy, vz]
+
+
+@dataclass(frozen=True)
+class LocalCandidateObservation:
+    """
+    One anonymous local measurement candidate from a UAV's local sensor.
+    """
+    measurement_id: int
+    relative_state: np.ndarray              # shape: (6,)
+    covariance_diagonal: np.ndarray         # shape: (6,)
+    valid: bool
+    timestamp: int
+
+
+@dataclass(frozen=True)
+class LocalObservationSet:
+    """
+    All local anonymous candidates observed by one UAV at one step.
+    """
+    agent_id: str
+    timestamp: int
+    candidates: tuple[LocalCandidateObservation, ...]
+
+
+@dataclass(frozen=True)
+class KeyTargetPrior:
+    """
+    External prior for one key target.
+    This may come from global sensing, previous fusion, or track propagation.
+    """
+    key_label: int
+    state_mean: np.ndarray                  # shape: (6,)
+    state_covariance: np.ndarray            # shape: (6, 6)
+    existence_prob: float
+    timestamp: int
+
+
+@dataclass(frozen=True)
+class AssociationHypothesis:
+    """
+    Association result between one local candidate and one local key-track hypothesis.
+    """
+    key_label: int
+    measurement_id: int
+    association_prob: float
+    innovation_distance: float
+    semantic_score: float
+    continuity_score: float
+
+
+@dataclass(frozen=True)
+class LocalTrackSummary:
+    """
+    One locally maintained key-target track after local association/update.
+    This is the core unit that replaces single-target AssociationOutput.
+    """
+    track_id: str
+    key_label: int
+    source_agent_id: str
+    timestamp: int
+
+    state_mean: np.ndarray                  # shape: (6,)
+    state_covariance: np.ndarray            # shape: (6, 6)
+
+    existence_prob: float
+    key_priority_score: float
+    continuity_score: float
+    identity_confidence: float
+
+    associated_measurement_ids: tuple[int, ...] = ()
+    association_probs: tuple[float, ...] = ()
+
+    last_update_step: int = 0
+    missed_detection_count: int = 0
+    age: int = 1
+
+    track_status: Literal["tentative", "confirmed", "coasting", "dropped"] = "tentative"
+
+
+@dataclass(frozen=True)
+class LocalTrackSet:
+    """
+    All locally maintained key-target tracks for one UAV at one step.
+    This is the unit reported to the centralized fusion controller.
+    """
+    agent_id: str
+    timestamp: int
+    tracks: tuple[LocalTrackSummary, ...]
+
+
+@dataclass(frozen=True)
+class CentralFusionInput:
+    """
+    Idealized report made available to the centralized fusion controller.
+    No network packetization, timing, or link-layer behavior is modeled here.
+    """
+    agent_id: str
+    timestamp: int
+    tracks: tuple[LocalTrackSummary, ...]
+
+
+@dataclass(frozen=True)
+class CrossAgentTrackMatch:
+    """
+    Result of track-to-track association across different UAVs.
+    """
+    key_label: int
+    agent_a: str
+    track_id_a: str
+    agent_b: str
+    track_id_b: str
+    match_score: float
+    mahalanobis_distance: float
+
+
+@dataclass(frozen=True)
+class FusedKeyTrack:
+    """
+    One fused centralized estimate of a key target after cross-UAV fusion.
+    """
+    key_label: int
+    timestamp: int
+
+    fused_state_mean: np.ndarray            # shape: (6,)
+    fused_state_covariance: np.ndarray      # shape: (6, 6)
+
+    contributing_agents: tuple[str, ...]
+    contributing_track_ids: tuple[str, ...]
+
+    existence_prob: float
+    continuity_score: float
+    identity_confidence: float
+
+
+@dataclass(frozen=True)
+class FusedTrackSet:
+    """
+    Centralized fusion output at one step.
+    """
+    timestamp: int
+    fused_tracks: tuple[FusedKeyTrack, ...]
+    cross_agent_matches: tuple[CrossAgentTrackMatch, ...] = ()

@@ -5,69 +5,105 @@ from dataclasses import dataclass
 import numpy as np
 
 
+STATE_DIM = 6
+
+
 @dataclass(frozen=True)
 class GlobalKeyTargetSensingConfig:
-    radar_delay_seconds: float
-    position_noise_std_m: float
+    prior_position_std_m: np.ndarray
+    prior_velocity_std_mps: np.ndarray
+
+    @property
+    def covariance_diagonal(self) -> np.ndarray:
+        return np.concatenate(
+            [
+                np.square(np.asarray(self.prior_position_std_m, dtype=float).reshape(3)),
+                np.square(np.asarray(self.prior_velocity_std_mps, dtype=float).reshape(3)),
+            ]
+        )
 
 
-class DelayedNoisyKeyTargetSensor:
-    """External global sensor for key-target positions.
+@dataclass(frozen=True)
+class GlobalKeyTargetStatePrior:
+    states: np.ndarray
+    covariance_diagonal: np.ndarray
 
-    It observes delayed key-target truth and adds small position noise. When the requested
-    delay reaches before the available history, the earliest available truth is used.
-    """
+
+class GlobalKeyTargetStatePriorSensor:
+    """External radar-like sensor that provides a noisy 6D key-target state prior."""
 
     def __init__(self, config: GlobalKeyTargetSensingConfig, seed: int | None = None) -> None:
         self.config = config
-        if self.config.radar_delay_seconds < 0.0:
+        position_std = np.asarray(self.config.prior_position_std_m, dtype=float).reshape(-1)
+        velocity_std = np.asarray(self.config.prior_velocity_std_mps, dtype=float).reshape(-1)
+        if position_std.shape != (3,):
             raise ValueError(
-                "global_sensing.radar_delay_seconds must be >= 0, "
-                f"got {self.config.radar_delay_seconds}."
+                "global_sensing.prior_position_std_m must resolve to a 3D vector, "
+                f"got shape {position_std.shape}."
             )
-        if self.config.position_noise_std_m < 0.0:
+        if velocity_std.shape != (3,):
             raise ValueError(
-                "global_sensing.key_enemy_position_noise_std_m must be >= 0, "
-                f"got {self.config.position_noise_std_m}."
+                "global_sensing.prior_velocity_std_mps must resolve to a 3D vector, "
+                f"got shape {velocity_std.shape}."
+            )
+        if np.any(position_std < 0.0):
+            raise ValueError(
+                "global_sensing.prior_position_std_m must be >= 0 on every axis, "
+                f"got {position_std.tolist()}."
+            )
+        if np.any(velocity_std < 0.0):
+            raise ValueError(
+                "global_sensing.prior_velocity_std_mps must be >= 0 on every axis, "
+                f"got {velocity_std.tolist()}."
             )
 
         self._seed = seed
         self._rng = np.random.default_rng(seed)
-        self._truth_history: list[np.ndarray] = []
-        self._cache: np.ndarray | None = None
+        self._cache: GlobalKeyTargetStatePrior | None = None
         self._cache_step: int | None = None
 
-    def reset(self, initial_key_positions: np.ndarray, seed: int | None = None) -> None:
+    def reset(self, seed: int | None = None) -> None:
         if seed is not None:
             self._seed = seed
         self._rng = np.random.default_rng(self._seed)
-        self._truth_history = [np.asarray(initial_key_positions, dtype=float).copy()]
         self._cache = None
         self._cache_step = None
 
-    def record_truth(self, key_positions: np.ndarray) -> None:
-        self._truth_history.append(np.asarray(key_positions, dtype=float).copy())
-        self._cache = None
-        self._cache_step = None
-
-    def observe(self, *, time_step: int, dt: float, fallback_key_positions: np.ndarray) -> np.ndarray:
+    def observe(self, *, time_step: int, key_target_states: np.ndarray) -> GlobalKeyTargetStatePrior:
         if self._cache_step == int(time_step) and self._cache is not None:
-            return self._cache.copy()
-
-        if not self._truth_history:
-            self._truth_history = [np.asarray(fallback_key_positions, dtype=float).copy()]
-
-        delay_steps = int(round(self.config.radar_delay_seconds / float(dt))) if dt > 0.0 else 0
-        history_idx = max(0, len(self._truth_history) - 1 - delay_steps)
-        observed_positions = self._truth_history[history_idx].copy()
-        if observed_positions.size and self.config.position_noise_std_m > 0.0:
-            noise = self._rng.normal(
-                loc=0.0,
-                scale=self.config.position_noise_std_m,
-                size=observed_positions.shape,
+            return GlobalKeyTargetStatePrior(
+                states=self._cache.states.copy(),
+                covariance_diagonal=self._cache.covariance_diagonal.copy(),
             )
-            observed_positions = observed_positions + noise
 
-        self._cache = observed_positions.astype(float, copy=True)
+        states = np.asarray(key_target_states, dtype=float)
+        if states.size == 0:
+            states = np.zeros((0, STATE_DIM), dtype=float)
+        elif states.ndim != 2 or states.shape[1] != STATE_DIM:
+            raise ValueError(f"key_target_states must have shape (N, {STATE_DIM}), got {states.shape}.")
+
+        noisy_states = states.copy()
+        if noisy_states.size:
+            noise_std = np.concatenate(
+                [
+                    np.asarray(self.config.prior_position_std_m, dtype=float).reshape(3),
+                    np.asarray(self.config.prior_velocity_std_mps, dtype=float).reshape(3),
+                ]
+            )
+            if np.any(noise_std > 0.0):
+                noisy_states = noisy_states + self._rng.normal(
+                    loc=0.0,
+                    scale=noise_std,
+                    size=noisy_states.shape,
+                )
+
+        covariance_diagonal = self.config.covariance_diagonal.astype(float, copy=True)
+        self._cache = GlobalKeyTargetStatePrior(
+            states=noisy_states.astype(float, copy=True),
+            covariance_diagonal=covariance_diagonal,
+        )
         self._cache_step = int(time_step)
-        return self._cache.copy()
+        return GlobalKeyTargetStatePrior(
+            states=self._cache.states.copy(),
+            covariance_diagonal=self._cache.covariance_diagonal.copy(),
+        )

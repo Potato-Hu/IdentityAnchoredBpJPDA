@@ -1,21 +1,18 @@
 # System Model
 
-## 1. Current Scope
+## 1. Scope
 
-The current project implements a **multi-UAV cooperative jamming and tracking training environment** with the following end-to-end pipeline:
+The current target architecture is a **centralized multi-UAV key-target tracking system** with the following end-to-end flow:
 
 1. Ground-truth scene generation and motion update
-2. Delayed/noisy global sensing of **key enemies only**
-3. Per-UAV local sensing of nearby **anonymous target candidates**
-4. Local association between global key priors and local candidates
-5. MAPPO training on policy observations built from local sensing
-6. Interference computation and reward feedback
+2. Weak external sensing of key-target priors
+3. Per-UAV local sensing of anonymous target candidates
+4. Local association and local key-track maintenance
+5. Central collection of per-UAV local key-track summaries
+6. Centralized track-to-track association and fusion
+7. Downstream task assignment and motion-control placeholders
 
-The code is no longer based on the earlier design where global observations were fed directly into policy training. In the current implementation:
-
-- **Global sensing is used only as an association prior**
-- **Local observations are the main policy input in the default training mode**
-- **Non-key enemies remain in the scene mainly as clutter / distractors**
+The system is no longer defined around MAPPO as the main modeling choice.
 
 ---
 
@@ -24,247 +21,211 @@ The code is no longer based on the earlier design where global observations were
 ### 2.1 Friendly UAVs
 
 - Count: `N_f`
-- State: 3D position and internally maintained velocity direction
-- Control: **discrete motion action**
+- State: 3D position and 3D velocity
+- Control: discrete motion action
 
-The implemented action space is not continuous velocity control. Each UAV selects one action from a fixed discrete direction set:
+The retained action space is:
 
 - one `stop` action
 - 26 normalized 3D movement directions
 
-The chosen direction is scaled by the UAV maximum speed `vmax`.
+This action space is preserved for later task-assignment and tracking-control work.
 
-### 2.2 Enemy Nodes
+### 2.2 Enemy Targets
 
-Enemy nodes are divided into:
+Targets are divided into:
 
-- **key enemies**
-- **non-key enemies**
+- `key`
+- `non-key`
 
-Total count:
-
-$$
-N_e = N_k + N_c
-$$
-
-In the current code:
-
-- key enemies are the targets relevant to global sensing, association, interference statistics, and rewards
-- non-key enemies are present in local sensing and scene dynamics, but are **not directly optimized in the current reward function**
+Key targets are the objects of interest for tracking quality. Non-key targets exist mainly to increase ambiguity, clutter pressure, and identity confusion near key targets.
 
 ---
 
-## 3. Dynamics and World State
+## 3. Scene Initialization
 
-The runtime world state is maintained by `src/env/world.py`.
+Implemented in `src/simulation/ground_truth.py`.
 
-- Enemy nodes move according to the configured mobility model in `config/env.yaml`
-- Friendly UAVs move according to discrete actions and fixed speed
-- Positions are clipped to 3D map bounds
-- One environment step advances both enemy motion and friendly motion, then recomputes interference
+The intended initialization logic is:
 
-The physical step size is controlled by:
+- key targets are placed within the scene bounds
+- non-key targets are generated near key targets so they act as realistic distractors
+- friendly UAVs are generated near the overall key-target region so they begin close enough to observe targets while still having overlapping fields of view
 
-$$
-\Delta t = \texttt{simulation.dt}
-$$
+This is intentionally different from a strict one-UAV-per-key-target initialization. The overlap is meant to support collaborative tracking rather than independent single-target pursuit.
 
 ---
 
 ## 4. Sensing Model
 
-### 4.1 Global Sensor
+### 4.1 External Key Priors
 
 Implemented in `src/sensing/global_sensor.py`.
 
-Its role is:
+The external sensing source provides weak 6D priors for key targets:
 
-- observe **key enemy positions only**
-- apply configurable radar delay
-- add Gaussian position noise
+- position mean
+- velocity mean
+- diagonal covariance
 
-So the returned global prior is better understood as:
+These priors are noisy and should be interpreted as coarse key-target hypotheses rather than exact global truth.
 
-$$
-z_k^{global}(t) = x_k(t-\tau) + \epsilon_k
-$$
+Their role is to:
 
-where:
-
-- `\tau` is the configured radar delay
-- `\epsilon_k` is Gaussian noise
-
-Important implementation note:
-
-- these global observations are **not directly concatenated into actor observations**
-- they are used by the association module as prior information
+- seed or stabilize key-track hypotheses
+- preserve key-target semantics
+- support local association under ambiguity
 
 ### 4.2 Local Sensor
 
 Implemented in `src/sensing/local_sensor.py`.
 
-Each friendly UAV receives a fixed-length local observation containing:
+Each UAV receives a fixed-length local candidate set containing:
 
-- relative positions of nearby detected candidates
-- a binary mask indicating which candidate slots are valid
+- relative 6D candidate states
+- a validity mask
+- local measurement covariance
 
-Current local sensing properties:
+Properties of the local sensing model:
 
 - limited detection radius
 - probabilistic missed detections
-- additive local position noise
-- Poisson clutter generation
+- additive measurement noise
+- clutter generation
 - no target id
-- no key/non-key label
+- no explicit key / non-key label
 
-This means the policy sees only **anonymous local candidates**, not labeled enemy tracks.
-
----
-
-## 5. Association Model
-
-Implemented in `src/sensing/association.py`.
-
-The project currently supports three association modes:
-
-- `none`
-- `nn`
-- `bp_jpda`
-
-### 5.1 `none`
-
-No global prior is used. Each UAV simply selects its nearest valid local candidate.
-
-### 5.2 `nn`
-
-Nearest-neighbor matching is performed between delayed/noisy global key priors and local candidates.
-
-### 5.3 `bp_jpda`
-
-This is the current approximate JPDA-style implementation:
-
-- each UAV solves its own local association problem
-- global key priors act as hypothesized targets
-- local anonymous candidates act as measurements
-- gating uses fused uncertainty from local noise, global noise, and delay-induced motion uncertainty
-- loopy belief propagation approximates marginal association probabilities
-
-The key output used by policy construction is **not a global target state estimate**, but a fixed-length weight vector over local candidates.
-
-That is:
-
-- local candidate positions come from the local sensor
-- association contributes a per-candidate confidence / weight
-- the policy still consumes a local-candidate representation
+Therefore, each UAV observes only anonymous local candidates.
 
 ---
 
-## 6. Policy Observation Construction
+## 5. Local Association and Local Tracking
 
-Implemented mainly in `src/env/swarm_env.py`.
+Implemented mainly in `src/sensing/association.py`.
 
-### 6.1 Default Mode: `local_only`
+The local association layer is intended to consume:
 
-This is the current training baseline.
+- weak key-target priors
+- current local candidate observations
+- previous local track hypotheses
 
-Per-agent observation consists of:
+and produce:
 
-- normalized self position
-- normalized relative positions of local candidates
-- local candidate validity mask
-- association weight vector aligned with the candidate slots
+- local key-target posterior track summaries
 
-Therefore, the default policy input is:
+Supported baseline families include:
 
-$$
-o_i = [\text{self},\ \text{local candidates},\ \text{mask},\ \text{association weights}]
-$$
+- nearest-candidate style matching
+- JPDA-style soft association
+- GM-PHD-style recursive estimation
 
-This is the most important design change relative to the early documents:
+For the recursive baselines, the local motion prior is now configurable:
 
-- **global sensing is not directly used for training inputs**
-- **local candidate observations are directly used for training**
-- **association only injects soft guidance into those local candidate slots**
+- `cv`: single constant-velocity prediction
+- `imm`: an interacting multiple-model predictor with a default bank of `cv`, `ca`, `ct_left`, and `ct_right`
 
-### 6.2 Debug Mode: `groundtruth`
+This is intentionally separate from the ground-truth enemy mobility. The environment may evolve targets with a
+Gauss-Markov motion process while the local recursive estimators propagate key-track hypotheses with an approximate
+CV or IMM kinematic prior before association and measurement update.
 
-The project also keeps a `groundtruth` mode for debugging.
+The target research direction is not symmetric target association. It is **priority-aware association**, where:
 
-In that mode, actor/critic inputs can use world-truth key-target features and related auxiliary information. This mode is for engineering comparison and debugging, not the main intended partial-observation setting.
+- key-target continuity matters more than target symmetry
+- identity consistency for key tracks is emphasized
+- non-key targets are treated primarily as confusing distractors
 
----
+The intended algorithmic extension is a **learned scoring front-end** for the classical recursive estimators already
+present in the repository. Rather than replacing the full filter, the learned module should use temporal context, weak
+global priors, local multi-candidate observations, and uncertainty to adjust:
 
-## 7. Critic State
+- track-candidate association strengths
+- missed-detection branches
+- existence-confidence updates
 
-The project uses MAPPO with a centralized critic.
-
-In the current implementation:
-
-- under `local_only`, the critic state is the concatenation of all agents' local policy observations
-- under `groundtruth`, the critic state contains normalized key-target positions, friendly positions, and interference-related quantities
-
-So the critic is centralized, but in the default mode it is still built from **stacked local observations**, not full omniscient world truth.
-
----
-
-## 8. Interference Model
-
-Interference is computed in `src/interference/channel.py` and used through the world snapshot.
-
-The current environment explicitly computes:
-
-- received jamming power at **key enemies**
-- received interference at **friendly UAVs**
-
-These quantities are used by reward computation and logging.
-
-At the current stage, non-key enemy interference is not the main optimization target in reward design, even though non-key enemies remain part of the sensed scene.
+The corrected scores then flow into a classical backend such as `JPDA` or `LMB`.
 
 ---
 
-## 9. Reward-Relevant Quantities
+## 6. Central Fusion Layer
 
-The current implementation supports two reward modes:
+This layer is the core centralized extension of the local estimators.
 
-- `difference`
-- `sustained_tracking`
+Each UAV exports a local key-track summary to an ideal central fusion controller instead of broadcasting raw measurements to peers. The central layer then performs:
 
-### 9.1 Difference Reward
+1. cross-UAV track-to-track association
+2. track consistency checking
+3. centralized fusion of matching key tracks
 
-This reward is based on:
+Expected outputs:
 
-- marginal contribution of each friendly UAV to key-target jamming utility
-- friendly safety penalty
+- fused key-target state means
+- fused covariances
+- confidence / existence scores
+- identity-consistency metadata
 
-The target utility uses a logarithmic saturation form:
+This keeps the architecture compatible with standard tracking baselines while keeping the repository focused on estimation, fusion, and downstream assignment rather than communication-protocol implementation.
 
-$$
-U = \frac{1}{N_k}\sum_k \log\left(1 + \frac{J_k}{J_0}\right)
-$$
+The current code models this as an **ideal centralized interface**:
 
-Each agent receives its counterfactual difference reward minus ally interference penalty.
-
-### 9.2 Sustained Tracking Reward
-
-This mode adds:
-
-- dynamic key-target assignment
-- assigned-target received power reward
-- distance progress reward
-- movement penalty
-- friendly safety penalty
-
-This mode is more aligned with "keep tracking and suppressing assigned key targets" than with the original coarse reward sketch.
+- every friendly UAV's local track set is synchronously available to the fusion center
+- no explicit packet format, bandwidth budget, or wireless-link simulator is modeled
+- the fusion center returns one `FusedTrackSet` back to the rest of the system
 
 ---
 
-## 10. Summary of What Changed from the Original Concept
+## 7. Task Assignment and Motion Control
 
-Compared with the original design notes, the current codebase has the following important differences:
+Task assignment and control are downstream modules and are not yet algorithmically filled in.
 
-1. Global observations are **not** used directly as policy inputs in the default setting.
-2. Local anonymous observations are the core actor inputs.
-3. Association outputs are encoded as **weights over local candidate slots**, not as direct fused target states for policy consumption.
-4. The action space is **discrete 3D motion**, not continuous control.
-5. The implemented reward currently focuses on **key-target jamming utility and friendly safety**, rather than an explicit `key - nonkey - friendly` full decomposition.
-6. The centralized critic in default mode uses concatenated local observations rather than full ground-truth state.
+The intended interfaces are:
+
+- **task assignment**: map fused key tracks to friendly UAV responsibilities
+- **motion control**: map assigned key tracks to discrete UAV actions
+
+The placeholders should preserve the current UAV action space and allow future replacement by:
+
+- rule-based tracking control
+- optimization-based assignment
+- learning-based control if needed later
+
+---
+
+## 8. Evaluation Quantities
+
+The primary quantities of interest are key-target-centric:
+
+- key-target OSPA
+- key-target RMSE
+
+Recommended diagnostic quantities:
+
+- key-track continuity
+- identity-switch count
+- missed-track duration
+
+At present, the repository directly exports `key-target RMSE` and `key-target OSPA`. For the priority-aware learned
+association direction, the continuity and identity diagnostics should become first-class reporting metrics rather than
+only secondary summaries.
+
+The system is therefore evaluated as a key-target tracking system, not primarily as a reward-optimization environment.
+
+---
+
+## 9. Repository Orientation
+
+After the modeling shift, the repository should be interpreted as containing three categories of code:
+
+1. **core tracking code**
+   - scene generation
+   - sensing
+   - association
+   - centralized fusion
+
+2. **downstream placeholders**
+   - task assignment
+   - motion control
+
+3. **tracking rollout and visualization utilities**
+   - export scripts
+   - plotting
+   - diagnostic summaries

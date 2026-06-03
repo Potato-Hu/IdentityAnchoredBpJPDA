@@ -4,7 +4,6 @@ __all__ = [
     "StepResult",
     "SwarmEnv",
     "SwarmWorld",
-    "SwarmSpaceSpec",
 ]
 
 
@@ -22,10 +21,4 @@ def __getattr__(name: str):
         from src.env.swarm_env import SwarmEnv
 
         return SwarmEnv
-
-    if name in {"SwarmSpaceSpec"}:
-        from src.env.spaces import SwarmSpaceSpec
-
-        return SwarmSpaceSpec
-
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
