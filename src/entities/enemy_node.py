@@ -31,12 +31,16 @@ class EnemyNode:
     mobility_model: str | None = None
     direction: float | None = None
     pitch: float | None = None
+    movement_lower_bounds: Sequence[float] | None = None
+    movement_upper_bounds: Sequence[float] | None = None
 
     rng: np.random.Generator = field(init=False, repr=False)
     coords: np.ndarray = field(init=False, repr=False)
     velocity_vector: np.ndarray = field(init=False, repr=False)
     initial_coords: np.ndarray = field(init=False, repr=False)
     initial_velocity: np.ndarray = field(init=False, repr=False)
+    local_lower_bounds: np.ndarray | None = field(init=False, repr=False, default=None)
+    local_upper_bounds: np.ndarray | None = field(init=False, repr=False, default=None)
     direction_mean: float = field(init=False)
     pitch_mean: float = field(init=False)
     motion_elapsed: float = field(init=False, default=0.0, repr=False)
@@ -52,6 +56,16 @@ class EnemyNode:
 
         self.rng = make_rng(self.seed, offset=self.node_id, fallback=get_default_seed())
         self.coords = _as_vector3(self.position, name="position")
+        self.local_lower_bounds = (
+            _as_vector3(self.movement_lower_bounds, name="movement_lower_bounds")
+            if self.movement_lower_bounds is not None
+            else None
+        )
+        self.local_upper_bounds = (
+            _as_vector3(self.movement_upper_bounds, name="movement_upper_bounds")
+            if self.movement_upper_bounds is not None
+            else None
+        )
         self.direction = self._init_direction(self.direction)
         self.pitch = self._init_pitch(self.pitch)
         self.direction_mean = self.direction
@@ -174,6 +188,8 @@ class EnemyNode:
             "direction": self.direction,
             "pitch": self.pitch,
             "mobility_model": self.mobility_model,
+            "movement_lower_bounds": None if self.local_lower_bounds is None else self.local_lower_bounds.copy(),
+            "movement_upper_bounds": None if self.local_upper_bounds is None else self.local_upper_bounds.copy(),
             "seed": self.seed if self.seed is not None else get_default_seed(),
         }
 
@@ -189,6 +205,8 @@ class EnemyNode:
             mobility_model=data.get("mobility_model"),
             direction=data.get("direction"),
             pitch=data.get("pitch"),
+            movement_lower_bounds=data.get("movement_lower_bounds"),
+            movement_upper_bounds=data.get("movement_upper_bounds"),
         )
 
     def _init_direction(self, direction: float | None) -> float:

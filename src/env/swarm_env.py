@@ -15,12 +15,14 @@ from src.sensing.association import (
     LMBFilterState,
     MultiTargetTrackOutput,
     STATE_DIM,
+    aa_bp_jpda_association_for_friendlies,
     bp_jpda_association_for_friendlies,
     empty_multi_target_track_output,
     flatten_track_output,
     gm_phd_association_for_friendlies,
     lmb_association_for_friendlies,
     nearest_local_candidate_association_for_friendlies,
+    sinkhorn_ajpda_association_for_friendlies,
 )
 from src.sensing.delta_glmb import DeltaGLMBFilterState, delta_glmb_association_for_friendlies
 from src.sensing.global_sensor import (
@@ -60,7 +62,7 @@ from src.utils.config_loader import (
 )
 
 TRACKING_INPUT_MODES = {"local_only", "groundtruth"}
-ASSOCIATION_METHODS = {"none", "bp_jpda", "gm_phd", "lmb", "delta_glmb"}
+ASSOCIATION_METHODS = {"none", "bp_jpda", "aa_bp_jpda", "sinkhorn_ajpda", "gm_phd", "lmb", "delta_glmb"}
 ASSIGNMENT_METHODS = {"placeholder", "hungarian"}
 
 
@@ -121,7 +123,8 @@ class SwarmEnv:
         self.association_method = get_tracking_association_method()
         if self.association_method not in ASSOCIATION_METHODS:
             raise ValueError(
-                "tracking.association_method must be one of 'none', 'bp_jpda', 'gm_phd', 'lmb', or 'delta_glmb', "
+                "tracking.association_method must be one of 'none', 'bp_jpda', 'aa_bp_jpda', "
+                "'sinkhorn_ajpda', 'gm_phd', 'lmb', or 'delta_glmb', "
                 f"got {self.association_method!r}."
             )
         self.assignment_method = get_tracking_assignment_method()
@@ -138,6 +141,29 @@ class SwarmEnv:
         self.bp_jpda_min_missed_detection_probability = float(
             association_config["bp_jpda_min_missed_detection_probability"]
         )
+        self.aa_bp_jpda_local_attention_temperature = float(
+            association_config["aa_bp_jpda_local_attention_temperature"]
+        )
+        self.aa_bp_jpda_cross_uav_position_scale_m = float(
+            association_config["aa_bp_jpda_cross_uav_position_scale_m"]
+        )
+        self.aa_bp_jpda_cross_uav_velocity_scale_mps = float(
+            association_config["aa_bp_jpda_cross_uav_velocity_scale_mps"]
+        )
+        self.aa_bp_jpda_cross_uav_support_threshold = float(
+            association_config["aa_bp_jpda_cross_uav_support_threshold"]
+        )
+        self.aa_bp_jpda_local_evidence_weight = float(association_config["aa_bp_jpda_local_evidence_weight"])
+        self.aa_bp_jpda_velocity_evidence_weight = float(association_config["aa_bp_jpda_velocity_evidence_weight"])
+        self.aa_bp_jpda_density_penalty_weight = float(association_config["aa_bp_jpda_density_penalty_weight"])
+        self.aa_bp_jpda_consensus_evidence_weight = float(
+            association_config["aa_bp_jpda_consensus_evidence_weight"]
+        )
+        self.aa_bp_jpda_consensus_count_weight = float(association_config["aa_bp_jpda_consensus_count_weight"])
+        self.aa_bp_jpda_max_log_evidence = float(association_config["aa_bp_jpda_max_log_evidence"])
+        self.sinkhorn_ajpda_iterations = int(association_config["sinkhorn_ajpda_iterations"])
+        self.sinkhorn_ajpda_temperature = float(association_config["sinkhorn_ajpda_temperature"])
+        self.sinkhorn_ajpda_missed_dummy_score = float(association_config["sinkhorn_ajpda_missed_dummy_score"])
         self.recursive_motion_model = str(association_config["recursive_motion_model"]).lower()
         self.imm_model_types = tuple(str(model_type) for model_type in association_config["imm_model_types"])
         self.imm_model_transition_matrix = association_config["imm_model_transition_matrix"]
@@ -426,6 +452,93 @@ class SwarmEnv:
                 imm_turn_rate_radps=self.imm_turn_rate_radps,
                 imm_ct_process_noise_scale=self.imm_ct_process_noise_scale,
                 confidence_threshold=self.gm_phd_confidence_threshold,
+            )
+            self._bp_jpda_filter_states = next_filter_states
+            self._last_association_outputs = outputs
+            self._last_association_time_step = self.world.time_step
+            return {agent_id: output for agent_id, output in outputs.items()}
+
+        if self.association_method == "aa_bp_jpda":
+            outputs, next_filter_states = aa_bp_jpda_association_for_friendlies(
+                friendly_states=friendly_states,
+                global_target_priors=global_key_priors,
+                local_observations=local_observations,
+                agent_ids=self.agent_ids,
+                previous_filter_states=self._bp_jpda_filter_states,
+                detection_radius_m=float(self.local_target_sensor.config.detection_radius_m),
+                relative_velocity_limit_mps=self.relative_velocity_limit_mps,
+                local_detection_probability=float(self.local_target_sensor.config.detection_probability),
+                clutter_rate_per_second=float(self.local_target_sensor.config.clutter_rate_per_second),
+                recursive_motion_model=self.recursive_motion_model,
+                imm_model_types=self.imm_model_types,
+                imm_model_transition_matrix=self.imm_model_transition_matrix,
+                imm_initial_model_probabilities=self.imm_initial_model_probabilities,
+                dt_seconds=float(self.local_target_sensor.config.dt_seconds),
+                gate_sigma=self.bp_jpda_gate_sigma,
+                max_iterations=self.bp_jpda_max_iterations,
+                convergence_tol=self.bp_jpda_convergence_tol,
+                min_missed_detection_probability=self.bp_jpda_min_missed_detection_probability,
+                survival_probability=self.gm_phd_survival_probability,
+                birth_weight=self.gm_phd_birth_weight,
+                process_position_std_m=self.gm_phd_process_position_std_m,
+                process_velocity_std_mps=self.gm_phd_process_velocity_std_mps,
+                imm_turn_rate_radps=self.imm_turn_rate_radps,
+                imm_ct_process_noise_scale=self.imm_ct_process_noise_scale,
+                confidence_threshold=self.gm_phd_confidence_threshold,
+                local_attention_temperature=self.aa_bp_jpda_local_attention_temperature,
+                cross_uav_position_scale_m=self.aa_bp_jpda_cross_uav_position_scale_m,
+                cross_uav_velocity_scale_mps=self.aa_bp_jpda_cross_uav_velocity_scale_mps,
+                cross_uav_support_threshold=self.aa_bp_jpda_cross_uav_support_threshold,
+                local_evidence_weight=self.aa_bp_jpda_local_evidence_weight,
+                velocity_evidence_weight=self.aa_bp_jpda_velocity_evidence_weight,
+                density_penalty_weight=self.aa_bp_jpda_density_penalty_weight,
+                consensus_evidence_weight=self.aa_bp_jpda_consensus_evidence_weight,
+                consensus_count_weight=self.aa_bp_jpda_consensus_count_weight,
+                max_log_evidence=self.aa_bp_jpda_max_log_evidence,
+            )
+            self._bp_jpda_filter_states = next_filter_states
+            self._last_association_outputs = outputs
+            self._last_association_time_step = self.world.time_step
+            return {agent_id: output for agent_id, output in outputs.items()}
+
+        if self.association_method == "sinkhorn_ajpda":
+            outputs, next_filter_states = sinkhorn_ajpda_association_for_friendlies(
+                friendly_states=friendly_states,
+                global_target_priors=global_key_priors,
+                local_observations=local_observations,
+                agent_ids=self.agent_ids,
+                previous_filter_states=self._bp_jpda_filter_states,
+                detection_radius_m=float(self.local_target_sensor.config.detection_radius_m),
+                relative_velocity_limit_mps=self.relative_velocity_limit_mps,
+                local_detection_probability=float(self.local_target_sensor.config.detection_probability),
+                clutter_rate_per_second=float(self.local_target_sensor.config.clutter_rate_per_second),
+                recursive_motion_model=self.recursive_motion_model,
+                imm_model_types=self.imm_model_types,
+                imm_model_transition_matrix=self.imm_model_transition_matrix,
+                imm_initial_model_probabilities=self.imm_initial_model_probabilities,
+                dt_seconds=float(self.local_target_sensor.config.dt_seconds),
+                gate_sigma=self.bp_jpda_gate_sigma,
+                sinkhorn_iterations=self.sinkhorn_ajpda_iterations,
+                sinkhorn_temperature=self.sinkhorn_ajpda_temperature,
+                sinkhorn_missed_dummy_score=self.sinkhorn_ajpda_missed_dummy_score,
+                min_missed_detection_probability=self.bp_jpda_min_missed_detection_probability,
+                survival_probability=self.gm_phd_survival_probability,
+                birth_weight=self.gm_phd_birth_weight,
+                process_position_std_m=self.gm_phd_process_position_std_m,
+                process_velocity_std_mps=self.gm_phd_process_velocity_std_mps,
+                imm_turn_rate_radps=self.imm_turn_rate_radps,
+                imm_ct_process_noise_scale=self.imm_ct_process_noise_scale,
+                confidence_threshold=self.gm_phd_confidence_threshold,
+                local_attention_temperature=self.aa_bp_jpda_local_attention_temperature,
+                cross_uav_position_scale_m=self.aa_bp_jpda_cross_uav_position_scale_m,
+                cross_uav_velocity_scale_mps=self.aa_bp_jpda_cross_uav_velocity_scale_mps,
+                cross_uav_support_threshold=self.aa_bp_jpda_cross_uav_support_threshold,
+                local_evidence_weight=self.aa_bp_jpda_local_evidence_weight,
+                velocity_evidence_weight=self.aa_bp_jpda_velocity_evidence_weight,
+                density_penalty_weight=self.aa_bp_jpda_density_penalty_weight,
+                consensus_evidence_weight=self.aa_bp_jpda_consensus_evidence_weight,
+                consensus_count_weight=self.aa_bp_jpda_consensus_count_weight,
+                max_log_evidence=self.aa_bp_jpda_max_log_evidence,
             )
             self._bp_jpda_filter_states = next_filter_states
             self._last_association_outputs = outputs

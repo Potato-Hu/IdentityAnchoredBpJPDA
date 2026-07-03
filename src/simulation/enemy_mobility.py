@@ -34,9 +34,32 @@ class BaseEnemyMobility:
         next_coords = np.asarray(node.coords, dtype=float) + np.asarray(node.velocity_vector, dtype=float) * float(dt)
         return self._clip_and_reflect(node, next_coords)
 
+    def _resolve_active_bounds(self, node: object) -> tuple[np.ndarray, np.ndarray]:
+        lower_override = getattr(node, "local_lower_bounds", None)
+        upper_override = getattr(node, "local_upper_bounds", None)
+        if lower_override is None or upper_override is None:
+            lower = np.full(3, self.safety_margin, dtype=float)
+            upper = self.bounds - self.safety_margin
+            return lower, upper
+
+        lower_bounds = np.asarray(lower_override, dtype=float)
+        upper_bounds = np.asarray(upper_override, dtype=float)
+        if lower_bounds.shape != (3,) or upper_bounds.shape != (3,):
+            raise ValueError("node-local mobility bounds must be 3D vectors.")
+        if np.any(upper_bounds <= lower_bounds):
+            raise ValueError("node-local mobility upper bounds must exceed lower bounds.")
+
+        lower = lower_bounds + self.safety_margin
+        upper = upper_bounds - self.safety_margin
+        if np.any(upper <= lower):
+            raise ValueError(
+                "node-local mobility bounds are too small after applying safety_margin; "
+                "increase the local region or reduce safety_margin."
+            )
+        return lower, upper
+
     def _clip_and_reflect(self, node: object, coords: np.ndarray) -> np.ndarray:
-        lower = np.full(3, self.safety_margin, dtype=float)
-        upper = self.bounds - self.safety_margin
+        lower, upper = self._resolve_active_bounds(node)
         velocity = np.asarray(node.velocity_vector, dtype=float).copy()
 
         for axis in range(3):

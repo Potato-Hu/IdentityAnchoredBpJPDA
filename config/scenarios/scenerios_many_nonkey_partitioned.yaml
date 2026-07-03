@@ -1,0 +1,23 @@
+extends: scenerios_base
+
+entity_counts:
+  # Keep key targets and friendlies unchanged, but greatly increase the number of
+  # non-key targets to create a clutter-heavy scene.
+  nonkey_targets: 30
+
+initialization:
+  # Spread non-key targets uniformly over the whole scene instead of spawning them
+  # around key targets.
+  nonkey_initialization_mode: uniform_random
+
+enemy_mobility:
+  non_key_companion:
+    # Once non-key targets are globally dispersed, they should no longer inherit
+    # headings from nearby key targets.
+    enabled: false
+
+  non_key_local_partition:
+    # Constrain each non-key target to the 4 x 4 x 4 partition cell that contains
+    # its initial position, so each one moves only inside its own 1/64 local volume.
+    enabled: true
+    grid_splits: [4, 4, 4]

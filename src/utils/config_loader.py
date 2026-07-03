@@ -10,6 +10,17 @@ import yaml
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _DEFAULT_CONFIG_PATH = _PROJECT_ROOT / "config" / "default.yaml"
 _ENV_CONFIG_PATH = _PROJECT_ROOT / "config" / "env.yaml"
+_SCENARIOS_DIR = _PROJECT_ROOT / "config" / "scenarios"
+_SCENE_SECTION_KEYS = ("scenerios", "scenarios")
+_SCENE_SELECTION_KEYS = (
+    "selected_scenario",
+    "selected_scene",
+    "selected_scenerio",
+    "scenario",
+    "scene",
+    "scenerio",
+)
+_SCENE_INHERITANCE_KEYS = ("extends", "base_scenario", "base_scene", "base_scenerio")
 
 
 def load_yaml_config(path: str | Path | None = None) -> dict[str, Any]:
@@ -35,8 +46,144 @@ def get_default_seed(path: str | Path | None = None) -> int:
     return int(seed)
 
 
+def _deep_merge_dicts(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge_dicts(dict(merged[key]), value)
+            continue
+        merged[key] = value
+    return merged
+
+
+def _get_scene_catalog(env_config: dict[str, Any]) -> dict[str, Any]:
+    scene_catalog: dict[str, Any] = {}
+    for key in _SCENE_SECTION_KEYS:
+        scene_catalog = env_config.get(key)
+        if isinstance(scene_catalog, dict):
+            break
+    file_scene_catalog = _load_scenario_file_catalog()
+    merged_catalog = dict(scene_catalog) if isinstance(scene_catalog, dict) else {}
+    merged_catalog.update(file_scene_catalog)
+    return merged_catalog
+
+
+def _load_scenario_file_catalog() -> dict[str, Any]:
+    if not _SCENARIOS_DIR.exists():
+        return {}
+
+    scene_catalog: dict[str, Any] = {}
+    for scenario_path in sorted(_SCENARIOS_DIR.glob("*.yaml")):
+        scenario_config = load_yaml_config(scenario_path)
+        if not scenario_config:
+            continue
+        scene_catalog[scenario_path.stem] = scenario_config
+    return scene_catalog
+
+
+def _get_selected_scenario_name_from_config(env_config: dict[str, Any]) -> str | None:
+    for key in _SCENE_SELECTION_KEYS:
+        raw_value = env_config.get(key)
+        if raw_value is None:
+            continue
+        scenario_name = str(raw_value).strip()
+        return scenario_name or None
+    return None
+
+
+def _resolve_scene_config(
+    scene_name: str,
+    scene_catalog: dict[str, Any],
+    *,
+    visited: set[str] | None = None,
+) -> dict[str, Any]:
+    if visited is None:
+        visited = set()
+    if scene_name in visited:
+        cycle = " -> ".join([*visited, scene_name])
+        raise ValueError(f"Detected recursive scenario inheritance: {cycle}.")
+    visited.add(scene_name)
+
+    selected_config = scene_catalog.get(scene_name)
+    if selected_config is None:
+        available_scenarios = ", ".join(sorted(str(name) for name in scene_catalog))
+        raise ValueError(
+            f"Selected scenario {scene_name!r} was not found in env config. "
+            f"Available scenarios: [{available_scenarios}]."
+        )
+    if not isinstance(selected_config, dict):
+        raise ValueError(f"Scenario {scene_name!r} must map to a config dict.")
+
+    resolved_config = dict(selected_config)
+    base_scene_name = None
+    for key in _SCENE_INHERITANCE_KEYS:
+        raw_base_scene_name = resolved_config.pop(key, None)
+        if raw_base_scene_name is None:
+            continue
+        base_scene_name = str(raw_base_scene_name).strip() or None
+        break
+
+    if base_scene_name is None:
+        return resolved_config
+
+    base_scene_config = _resolve_scene_config(base_scene_name, scene_catalog, visited=visited)
+    return _deep_merge_dicts(base_scene_config, resolved_config)
+
+
+def get_selected_scenario_name(path: str | Path | None = None) -> str | None:
+    """Read the active scene name from env config."""
+
+    env_config = load_yaml_config(path or _ENV_CONFIG_PATH)
+    return _get_selected_scenario_name_from_config(env_config)
+
+
+def _get_selected_scenario_config_from_config(env_config: dict[str, Any]) -> dict[str, Any]:
+    selected_scenario_name = _get_selected_scenario_name_from_config(env_config)
+    if selected_scenario_name is None:
+        return {}
+
+    scene_catalog = _get_scene_catalog(env_config)
+    if not scene_catalog:
+        return {}
+    return _resolve_scene_config(selected_scenario_name, scene_catalog)
+
+
+def get_selected_scenario_config(path: str | Path | None = None) -> dict[str, Any]:
+    """Read the selected scene block from env config."""
+
+    env_config = load_yaml_config(path or _ENV_CONFIG_PATH)
+    return _get_selected_scenario_config_from_config(env_config)
+
+
 def get_env_config(path: str | Path | None = None) -> dict[str, Any]:
-    return load_yaml_config(path or _ENV_CONFIG_PATH)
+    env_config = load_yaml_config(path or _ENV_CONFIG_PATH)
+    selected_scenario_name = _get_selected_scenario_name_from_config(env_config)
+    if selected_scenario_name is None:
+        return env_config
+
+    selected_scenario_config = _get_selected_scenario_config_from_config(env_config)
+    if not selected_scenario_config:
+        return env_config
+
+    merged_env_config = dict(env_config)
+    for section_name in (
+        "entity_counts",
+        "initialization",
+        "enemy_mobility",
+        "global_sensing",
+        "local_sensing",
+    ):
+        scene_section_config = selected_scenario_config.get(section_name)
+        if not isinstance(scene_section_config, dict):
+            continue
+
+        base_section_config = merged_env_config.get(section_name, {})
+        if not isinstance(base_section_config, dict):
+            base_section_config = {}
+        merged_env_config[section_name] = _deep_merge_dicts(base_section_config, scene_section_config)
+
+    merged_env_config["_selected_scenario"] = selected_scenario_name
+    return merged_env_config
 
 
 def get_entity_count_config(path: str | Path | None = None) -> dict[str, int]:
@@ -93,6 +240,9 @@ def get_initialization_config(path: str | Path | None = None) -> dict[str, Any]:
         "friend_drone_min_separation_m": float(
             initialization_config.get("friendly_uav_min_separation_m", 0.0)
         ),
+        "nonkey_initialization_mode": str(
+            initialization_config.get("nonkey_initialization_mode", "near_key")
+        ).lower(),
     }
 
 
@@ -297,6 +447,37 @@ def get_association_config(path: str | Path | None = None) -> dict[str, Any]:
         "bp_jpda_convergence_tol": float(association_config.get("bp_jpda_convergence_tol", 1.0e-3)),
         "bp_jpda_min_missed_detection_probability": float(
             association_config.get("bp_jpda_min_missed_detection_probability", 0.05)
+        ),
+        "aa_bp_jpda_local_attention_temperature": float(
+            association_config.get("aa_bp_jpda_local_attention_temperature", 2.0)
+        ),
+        "aa_bp_jpda_cross_uav_position_scale_m": float(
+            association_config.get("aa_bp_jpda_cross_uav_position_scale_m", 8.0)
+        ),
+        "aa_bp_jpda_cross_uav_velocity_scale_mps": float(
+            association_config.get("aa_bp_jpda_cross_uav_velocity_scale_mps", 3.0)
+        ),
+        "aa_bp_jpda_cross_uav_support_threshold": float(
+            association_config.get("aa_bp_jpda_cross_uav_support_threshold", 0.35)
+        ),
+        "aa_bp_jpda_local_evidence_weight": float(association_config.get("aa_bp_jpda_local_evidence_weight", 0.6)),
+        "aa_bp_jpda_velocity_evidence_weight": float(
+            association_config.get("aa_bp_jpda_velocity_evidence_weight", 0.25)
+        ),
+        "aa_bp_jpda_density_penalty_weight": float(
+            association_config.get("aa_bp_jpda_density_penalty_weight", 0.35)
+        ),
+        "aa_bp_jpda_consensus_evidence_weight": float(
+            association_config.get("aa_bp_jpda_consensus_evidence_weight", 0.9)
+        ),
+        "aa_bp_jpda_consensus_count_weight": float(
+            association_config.get("aa_bp_jpda_consensus_count_weight", 0.45)
+        ),
+        "aa_bp_jpda_max_log_evidence": float(association_config.get("aa_bp_jpda_max_log_evidence", 1.5)),
+        "sinkhorn_ajpda_iterations": int(association_config.get("sinkhorn_ajpda_iterations", 30)),
+        "sinkhorn_ajpda_temperature": float(association_config.get("sinkhorn_ajpda_temperature", 1.0)),
+        "sinkhorn_ajpda_missed_dummy_score": float(
+            association_config.get("sinkhorn_ajpda_missed_dummy_score", -0.5)
         ),
         "recursive_motion_model": recursive_motion_model,
         "imm_model_types": imm_model_types,

@@ -67,6 +67,36 @@ def _random_positions(count: int, bounds: np.ndarray, rng: np.random.Generator) 
     return rng.uniform(low=np.zeros(3, dtype=float), high=bounds, size=(count, 3))
 
 
+def _read_grid_splits(raw_value: object, *, default: Sequence[int] = (4, 4, 4)) -> np.ndarray:
+    grid_splits = np.asarray(default if raw_value is None else raw_value, dtype=int)
+    if grid_splits.ndim == 0:
+        grid_splits = np.full(3, int(grid_splits), dtype=int)
+    if grid_splits.shape != (3,):
+        raise ValueError(f"grid_splits must be a scalar or 3D vector, got shape {grid_splits.shape}.")
+    if np.any(grid_splits <= 0):
+        raise ValueError("grid_splits must contain strictly positive integers.")
+    return grid_splits.astype(int)
+
+
+def _movement_partition_bounds_for_positions(
+    positions: np.ndarray,
+    scene_bounds: np.ndarray,
+    *,
+    grid_splits: Sequence[int],
+) -> tuple[np.ndarray, np.ndarray]:
+    if positions.shape[0] == 0:
+        return np.zeros((0, 3), dtype=float), np.zeros((0, 3), dtype=float)
+
+    partition_counts = _read_grid_splits(grid_splits)
+    cell_sizes = scene_bounds / partition_counts.astype(float)
+    partition_indices = np.floor(positions / cell_sizes.reshape(1, 3)).astype(int)
+    partition_indices = np.clip(partition_indices, 0, partition_counts.reshape(1, 3) - 1)
+    lower_bounds = partition_indices.astype(float) * cell_sizes.reshape(1, 3)
+    upper_bounds = (partition_indices.astype(float) + 1.0) * cell_sizes.reshape(1, 3)
+    upper_bounds = np.minimum(upper_bounds, scene_bounds.reshape(1, 3))
+    return lower_bounds.astype(float), upper_bounds.astype(float)
+
+
 def _nearby_distance_limits(bounds: np.ndarray, limits: Sequence[float] | None = None) -> tuple[float, float]:
     if limits is None:
         min_distance = float(bounds[0] / 40.0)
@@ -353,6 +383,9 @@ def assign_initial_positions(
     configured_distance_limits = dict(get_initialization_config())
     configured_distance_limits.update(dict(nearby_distance_limits or {}))
     position_rng = rng if rng is not None else np.random.default_rng()
+    nonkey_initialization_mode = str(
+        configured_distance_limits.get("nonkey_initialization_mode", "near_key")
+    ).lower()
 
     key_positions = (
         _validate_positions("key_enemy", manual_positions["key_enemy"], key_num, scene_bounds)
@@ -361,6 +394,9 @@ def assign_initial_positions(
     )
     if manual_positions.get("nonkey_enemy") is not None:
         nonkey_positions = _validate_positions("nonkey_enemy", manual_positions["nonkey_enemy"], nonkey_num, scene_bounds)
+        nonkey_anchor_indices = _nearest_anchor_indices(nonkey_positions, key_positions)
+    elif nonkey_initialization_mode == "uniform_random":
+        nonkey_positions = _random_positions(nonkey_num, scene_bounds, position_rng)
         nonkey_anchor_indices = _nearest_anchor_indices(nonkey_positions, key_positions)
     else:
         nonkey_positions, nonkey_anchor_indices = _sample_near_anchors_with_indices(
@@ -417,6 +453,9 @@ def initialize_scene(
     companion_config = mobility_config.get("non_key_companion", {})
     if not isinstance(companion_config, dict):
         companion_config = {}
+    nonkey_local_partition_config = mobility_config.get("non_key_local_partition", {})
+    if not isinstance(nonkey_local_partition_config, dict):
+        nonkey_local_partition_config = {}
     use_nonkey_companion = bool(companion_config.get("enabled", False))
     companion_direction_jitter_std = float(companion_config.get("direction_jitter_std", 0.15))
     companion_pitch_jitter_std = float(companion_config.get("pitch_jitter_std", 0.03))
@@ -434,6 +473,16 @@ def initialize_scene(
     enemy_nodes: list[EnemyNode] = []
     key_indices = set(np.asarray(positions["key_indices"], dtype=int).tolist())
     nonkey_anchor_indices = np.asarray(positions["nonkey_anchor_indices"], dtype=int)
+    nonkey_positions = np.asarray(positions["nonkey_enemy"], dtype=float)
+    nonkey_local_partition_enabled = bool(nonkey_local_partition_config.get("enabled", False))
+    nonkey_partition_grid_splits = _read_grid_splits(
+        nonkey_local_partition_config.get("grid_splits", [4, 4, 4])
+    )
+    nonkey_lower_bounds, nonkey_upper_bounds = _movement_partition_bounds_for_positions(
+        nonkey_positions,
+        scene_bounds,
+        grid_splits=nonkey_partition_grid_splits,
+    )
     key_directions = {
         key_idx: 0.0 if key_idx % 2 == 0 else np.pi
         for key_idx in key_indices
@@ -451,6 +500,12 @@ def initialize_scene(
         else:
             direction = 0.0 if node_id % 2 == 0 else np.pi
             pitch = -0.04
+        local_lower_bounds = None
+        local_upper_bounds = None
+        if role != "key" and nonkey_local_partition_enabled:
+            nonkey_idx = node_id - key_num
+            local_lower_bounds = nonkey_lower_bounds[nonkey_idx]
+            local_upper_bounds = nonkey_upper_bounds[nonkey_idx]
         enemy_nodes.append(
             EnemyNode(
                 node_id=node_id,
@@ -460,6 +515,8 @@ def initialize_scene(
                 seed=base_seed + node_id,
                 direction=direction,
                 pitch=pitch,
+                movement_lower_bounds=local_lower_bounds,
+                movement_upper_bounds=local_upper_bounds,
             )
         )
 

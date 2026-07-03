@@ -90,6 +90,23 @@ class LMBFilterState:
     motion_state: IMMMotionState | None = None
 
 
+@dataclass(frozen=True)
+class _BPJPDAAgentContext:
+    agent_id: str
+    friendly_state: np.ndarray
+    prior_relative_states: np.ndarray
+    prior_covariance: np.ndarray
+    local_relative_states: np.ndarray
+    local_covariance: np.ndarray
+    valid_indices: np.ndarray
+    candidate_states: np.ndarray
+    predicted_means: tuple[np.ndarray, ...]
+    predicted_covariances: tuple[np.ndarray, ...]
+    predicted_motion_states: tuple[IMMMotionState, ...]
+    track_active: np.ndarray
+    likelihood_ratios: np.ndarray
+
+
 def _as_state_batch(states: np.ndarray, *, name: str) -> np.ndarray:
     array = np.asarray(states, dtype=float)
     if array.size == 0:
@@ -1513,6 +1530,386 @@ def nearest_local_candidate_association_for_friendlies(
     return outputs
 
 
+def _build_bp_jpda_context(
+    *,
+    agent_id: str,
+    friendly_state: np.ndarray,
+    global_target_priors: GlobalKeyTargetStatePrior,
+    local_observation: LocalTargetObservation,
+    previous_filter_state: dict[int, BPJPDAFilterState],
+    detection_radius_m: float,
+    relative_velocity_limit_mps: float,
+    local_detection_probability: float,
+    clutter_rate_per_second: float,
+    recursive_motion_model: str,
+    imm_model_types: Sequence[str],
+    imm_model_transition_matrix: np.ndarray | Sequence[Sequence[float]] | None,
+    imm_initial_model_probabilities: np.ndarray | Sequence[float] | None,
+    dt_seconds: float,
+    gate_sigma: float,
+    missed_detection_probability: float,
+    survival_probability: float,
+    birth_weight: float,
+    process_position_std: np.ndarray,
+    process_velocity_std: np.ndarray,
+    imm_turn_rate_radps: float,
+    imm_ct_process_noise_scale: float,
+) -> _BPJPDAAgentContext:
+    friendly = _as_state_vector(friendly_state, name="friendly_state")
+    prior_relative_states, prior_covariance = _build_prior_relative_states(
+        friendly,
+        global_target_priors,
+    )
+    local_relative_states, local_mask, local_covariance = _validate_local_observation(local_observation)
+    valid_indices = np.flatnonzero(local_mask > 0.0)
+
+    predicted_means: list[np.ndarray] = []
+    predicted_covariances: list[np.ndarray] = []
+    predicted_motion_states: list[IMMMotionState] = []
+    track_active = np.ones(prior_relative_states.shape[0], dtype=bool)
+    for target_idx in range(prior_relative_states.shape[0]):
+        predicted_mean, predicted_covariance, predicted_motion_state = _bp_jpda_predict_track_state(
+            previous_filter_state=previous_filter_state.get(target_idx),
+            prior_relative_state=prior_relative_states[target_idx],
+            prior_covariance_diagonal=prior_covariance,
+            recursive_motion_model=recursive_motion_model,
+            imm_model_types=imm_model_types,
+            imm_model_transition_matrix=imm_model_transition_matrix,
+            imm_initial_model_probabilities=imm_initial_model_probabilities,
+            dt_seconds=dt_seconds,
+            survival_probability=survival_probability,
+            birth_weight=birth_weight,
+            process_position_std=process_position_std,
+            process_velocity_std=process_velocity_std,
+            imm_turn_rate_radps=imm_turn_rate_radps,
+            imm_ct_process_noise_scale=imm_ct_process_noise_scale,
+        )
+        predicted_means.append(predicted_mean)
+        predicted_covariances.append(predicted_covariance)
+        predicted_motion_states.append(predicted_motion_state)
+        innovation_covariance_diagonal = np.diag(predicted_covariance) + local_covariance
+        prior_position_distance = float(np.linalg.norm(predicted_mean[:3]))
+        if prior_position_distance > float(detection_radius_m) + _position_gate_margin(
+            innovation_covariance_diagonal,
+            gate_sigma,
+        ):
+            track_active[target_idx] = False
+
+    candidate_states = local_relative_states[valid_indices] if valid_indices.size else np.zeros((0, STATE_DIM), dtype=float)
+    likelihood_ratios = np.zeros((prior_relative_states.shape[0], valid_indices.size), dtype=float)
+
+    position_volume = (4.0 / 3.0) * np.pi * max(float(detection_radius_m), 1.0e-6) ** 3
+    velocity_support = max(float(relative_velocity_limit_mps), 1.0e-6)
+    velocity_volume = np.power(2.0 * velocity_support, 3)
+    measurement_volume = max(position_volume * velocity_volume, 1.0e-9)
+    clutter_rate_per_step = max(float(clutter_rate_per_second), 0.0) * max(float(dt_seconds), 1.0e-6)
+    clutter_intensity = max(clutter_rate_per_step / measurement_volume, 1.0e-9)
+
+    for target_idx in range(prior_relative_states.shape[0]):
+        if not track_active[target_idx] or valid_indices.size == 0:
+            continue
+        predicted_mean = predicted_means[target_idx]
+        predicted_covariance = predicted_covariances[target_idx]
+        innovation_covariance_diagonal = np.diag(predicted_covariance) + local_covariance
+        residuals = candidate_states - predicted_mean.reshape(1, STATE_DIM)
+        squared_mahalanobis = np.sum(
+            np.square(residuals) / innovation_covariance_diagonal.reshape(1, STATE_DIM),
+            axis=1,
+        )
+        gated_offsets = np.flatnonzero(squared_mahalanobis <= float(gate_sigma) ** 2)
+        if gated_offsets.size == 0:
+            continue
+        gaussian_likelihood = _gaussian_pdf_zero_mean_diag(
+            residuals[gated_offsets],
+            innovation_covariance_diagonal,
+        )
+        likelihood_ratios[target_idx, gated_offsets] = (
+            local_detection_probability * gaussian_likelihood / clutter_intensity
+        ) / missed_detection_probability
+
+    return _BPJPDAAgentContext(
+        agent_id=str(agent_id),
+        friendly_state=friendly.astype(float, copy=True),
+        prior_relative_states=prior_relative_states,
+        prior_covariance=prior_covariance,
+        local_relative_states=local_relative_states,
+        local_covariance=local_covariance,
+        valid_indices=valid_indices,
+        candidate_states=candidate_states,
+        predicted_means=tuple(predicted_means),
+        predicted_covariances=tuple(predicted_covariances),
+        predicted_motion_states=tuple(predicted_motion_states),
+        track_active=track_active,
+        likelihood_ratios=likelihood_ratios,
+    )
+
+
+def _softmax(values: np.ndarray) -> np.ndarray:
+    if values.size == 0:
+        return np.zeros_like(values, dtype=float)
+    shifted = values - float(np.max(values))
+    weights = np.exp(shifted)
+    total = float(np.sum(weights))
+    if total <= 0.0:
+        return np.full(values.shape, 1.0 / max(values.size, 1), dtype=float)
+    return weights / total
+
+
+def _cosine_similarity(vector_a: np.ndarray, vector_b: np.ndarray) -> float:
+    norm_a = float(np.linalg.norm(vector_a))
+    norm_b = float(np.linalg.norm(vector_b))
+    if norm_a <= 1.0e-6 or norm_b <= 1.0e-6:
+        return 0.0
+    return float(np.clip(float(vector_a @ vector_b) / (norm_a * norm_b), -1.0, 1.0))
+
+
+def _candidate_density_scores(candidate_states: np.ndarray, *, radius_m: float) -> np.ndarray:
+    if candidate_states.shape[0] == 0:
+        return np.zeros(0, dtype=float)
+    position_deltas = candidate_states[:, None, :3] - candidate_states[None, :, :3]
+    distances = np.linalg.norm(position_deltas, axis=-1)
+    neighbor_counts = np.sum((distances <= float(radius_m)) & (distances > 0.0), axis=1)
+    denominator = max(candidate_states.shape[0] - 1, 1)
+    return neighbor_counts.astype(float) / float(denominator)
+
+
+def _normalized_entropy(probabilities: np.ndarray) -> float:
+    values = np.asarray(probabilities, dtype=float).reshape(-1)
+    if values.size <= 1:
+        return 0.0
+    clipped = np.maximum(values, 1.0e-12)
+    entropy = -float(np.sum(clipped * np.log(clipped)))
+    return float(np.clip(entropy / np.log(float(values.size)), 0.0, 1.0))
+
+
+def _run_sinkhorn(
+    log_scores: np.ndarray,
+    row_marginals: np.ndarray,
+    column_marginals: np.ndarray,
+    *,
+    iterations: int,
+    temperature: float,
+) -> np.ndarray:
+    scores = np.asarray(log_scores, dtype=float)
+    rows = np.asarray(row_marginals, dtype=float).reshape(-1)
+    columns = np.asarray(column_marginals, dtype=float).reshape(-1)
+    if scores.shape != (rows.shape[0], columns.shape[0]):
+        raise ValueError(
+            "log_scores shape must match row and column marginals, "
+            f"got {scores.shape}, {rows.shape}, and {columns.shape}."
+        )
+    if iterations <= 0:
+        raise ValueError(f"iterations must be > 0, got {iterations}.")
+    if temperature <= 0.0:
+        raise ValueError(f"temperature must be > 0, got {temperature}.")
+
+    row_total = float(np.sum(rows))
+    column_total = float(np.sum(columns))
+    if row_total <= 0.0 or column_total <= 0.0:
+        return np.zeros_like(scores, dtype=float)
+    columns = columns * (row_total / column_total)
+
+    kernel = np.exp(np.clip(scores / float(temperature), -40.0, 40.0))
+    kernel = np.maximum(kernel, 1.0e-12)
+    for _ in range(int(iterations)):
+        row_sums = np.sum(kernel, axis=1)
+        kernel *= (rows / np.maximum(row_sums, 1.0e-12)).reshape(-1, 1)
+        column_sums = np.sum(kernel, axis=0)
+        kernel *= (columns / np.maximum(column_sums, 1.0e-12)).reshape(1, -1)
+    return kernel
+
+
+def _enhance_likelihoods_with_aa_bp_jpda(
+    *,
+    context: _BPJPDAAgentContext,
+    all_contexts: Sequence[_BPJPDAAgentContext],
+    gate_sigma: float,
+    local_attention_temperature: float,
+    cross_uav_position_scale_m: float,
+    cross_uav_velocity_scale_mps: float,
+    cross_uav_support_threshold: float,
+    local_evidence_weight: float,
+    velocity_evidence_weight: float,
+    density_penalty_weight: float,
+    consensus_evidence_weight: float,
+    consensus_count_weight: float,
+    max_log_evidence: float,
+) -> np.ndarray:
+    # AA-BP-JPDA keeps the baseline gated likelihoods, then reweights them with
+    # local target-candidate attention and cross-UAV candidate consensus evidence.
+    enhanced = np.asarray(context.likelihood_ratios, dtype=float).copy()
+    if enhanced.size == 0:
+        return enhanced
+
+    candidate_density = _candidate_density_scores(context.candidate_states, radius_m=cross_uav_position_scale_m)
+    agent_count = len(all_contexts)
+    other_agent_denominator = max(agent_count - 1, 1)
+
+    for target_idx in range(enhanced.shape[0]):
+        active_offsets = np.flatnonzero(enhanced[target_idx] > 0.0)
+        if active_offsets.size == 0:
+            continue
+
+        predicted_mean = context.predicted_means[target_idx]
+        predicted_covariance = context.predicted_covariances[target_idx]
+        innovation_covariance_diagonal = np.diag(predicted_covariance) + context.local_covariance
+        residuals = context.candidate_states[active_offsets] - predicted_mean.reshape(1, STATE_DIM)
+        mahalanobis_sq = np.sum(
+            np.square(residuals) / innovation_covariance_diagonal.reshape(1, STATE_DIM),
+            axis=1,
+        )
+        local_attention = _softmax(-mahalanobis_sq / max(float(local_attention_temperature), 1.0e-6))
+        ambiguity_gate = _normalized_entropy(local_attention)
+
+        candidate_batch = context.candidate_states[active_offsets]
+        candidate_global_batch = context.friendly_state.reshape(1, STATE_DIM) + candidate_batch
+        local_attention_gain = np.log(np.maximum(local_attention * float(active_offsets.size), 1.0e-6))
+        velocity_alignment = np.asarray(
+            [_cosine_similarity(predicted_mean[3:6], candidate_state[3:6]) for candidate_state in candidate_batch],
+            dtype=float,
+        )
+        normalized_mahalanobis = np.sqrt(np.maximum(mahalanobis_sq, 0.0)) / max(float(gate_sigma), 1.0e-6)
+        local_scores = (
+            float(local_evidence_weight) * (local_attention_gain - normalized_mahalanobis)
+            + float(velocity_evidence_weight) * velocity_alignment
+            - float(density_penalty_weight) * candidate_density[active_offsets]
+        )
+
+        consensus_scores = np.zeros(active_offsets.size, dtype=float)
+        if ambiguity_gate > 0.0:
+            consensus_support = np.zeros(active_offsets.size, dtype=float)
+            supporting_agents = np.zeros(active_offsets.size, dtype=float)
+            for other_context in all_contexts:
+                if other_context.agent_id == context.agent_id:
+                    continue
+                if target_idx >= other_context.likelihood_ratios.shape[0]:
+                    continue
+                other_offsets = np.flatnonzero(other_context.likelihood_ratios[target_idx] > 0.0)
+                if other_offsets.size == 0:
+                    continue
+                other_global_states = other_context.friendly_state.reshape(1, STATE_DIM) + other_context.candidate_states[
+                    other_offsets
+                ]
+                position_distances = np.linalg.norm(
+                    candidate_global_batch[:, None, :3] - other_global_states[None, :, :3],
+                    axis=-1,
+                )
+                velocity_distances = np.linalg.norm(
+                    candidate_global_batch[:, None, 3:6] - other_global_states[None, :, 3:6],
+                    axis=-1,
+                )
+                support_kernel = np.exp(
+                    -0.5 * np.square(position_distances / max(float(cross_uav_position_scale_m), 1.0e-6))
+                    -0.5 * np.square(velocity_distances / max(float(cross_uav_velocity_scale_mps), 1.0e-6))
+                )
+                best_support = np.max(support_kernel, axis=1)
+                consensus_support += best_support
+                supporting_agents += (best_support >= float(cross_uav_support_threshold)).astype(float)
+
+            consensus_ratio = consensus_support / float(other_agent_denominator)
+            support_count_ratio = supporting_agents / float(other_agent_denominator)
+            consensus_scores = ambiguity_gate * (
+                float(consensus_evidence_weight) * (consensus_ratio - 0.5)
+                + float(consensus_count_weight) * support_count_ratio
+            )
+
+        evidence = np.clip(local_scores + consensus_scores, -float(max_log_evidence), float(max_log_evidence))
+        enhanced[target_idx, active_offsets] *= np.exp(evidence)
+
+    return enhanced
+
+
+def _build_bp_jpda_tracks_from_marginals(
+    *,
+    context: _BPJPDAAgentContext,
+    marginals: np.ndarray,
+    confidence_threshold: float,
+) -> tuple[MultiTargetTrackOutput, dict[int, BPJPDAFilterState]]:
+    agent_tracks: list[KeyTrackPosterior] = []
+    agent_next_states: dict[int, BPJPDAFilterState] = {}
+    for target_idx in range(context.prior_relative_states.shape[0]):
+        predicted_mean = context.predicted_means[target_idx]
+        predicted_covariance = context.predicted_covariances[target_idx]
+        predicted_motion_state = context.predicted_motion_states[target_idx]
+        full_weights = np.zeros(context.local_relative_states.shape[0], dtype=np.float32)
+        if context.valid_indices.size:
+            full_weights[context.valid_indices] = marginals[target_idx].astype(np.float32)
+        confidence = float(np.clip(np.sum(full_weights), 0.0, 1.0))
+        missed_probability = float(np.clip(1.0 - confidence, 0.0, 1.0))
+
+        posterior_motion_states: list[IMMMotionState] = [predicted_motion_state]
+        posterior_weights: list[float] = [missed_probability]
+        best_local_index = -1
+        best_innovation_distance = np.inf
+        for candidate_offset in range(context.valid_indices.size):
+            candidate_weight = float(marginals[target_idx, candidate_offset])
+            if candidate_weight <= 0.0:
+                continue
+            posterior_motion_state_j, innovation_distance = _update_motion_state_with_measurement(
+                predicted_motion_state,
+                measurement_state=context.candidate_states[candidate_offset],
+                measurement_covariance_diagonal=context.local_covariance,
+            )
+            posterior_motion_states.append(posterior_motion_state_j)
+            posterior_weights.append(candidate_weight)
+            if innovation_distance < best_innovation_distance:
+                best_innovation_distance = innovation_distance
+                best_local_index = int(context.valid_indices[candidate_offset])
+
+        if float(np.sum(posterior_weights)) <= 0.0:
+            posterior_motion_states = [predicted_motion_state]
+            posterior_weights = [1.0]
+
+        posterior_motion_state = _merge_motion_hypotheses(
+            posterior_motion_states,
+            posterior_weights,
+        )
+        posterior_state, posterior_covariance = _collapse_motion_state(posterior_motion_state)
+        posterior_covariance_diagonal = np.diag(posterior_covariance)
+        valid = bool(context.track_active[target_idx] and confidence >= confidence_threshold and np.any(full_weights > 0.0))
+        if best_local_index < 0 and context.valid_indices.size:
+            weight_support, nearest_index, nearest_distance = _nearest_measurement_support(
+                posterior_state,
+                context.local_relative_states,
+                context.valid_indices,
+            )
+            if not np.any(full_weights > 0.0):
+                full_weights = weight_support
+            if nearest_index >= 0:
+                best_local_index = nearest_index
+                best_innovation_distance = nearest_distance
+
+        agent_tracks.append(
+            KeyTrackPosterior(
+                global_target_index=target_idx,
+                prior_relative_state=context.prior_relative_states[target_idx].astype(np.float32),
+                prior_covariance_diagonal=context.prior_covariance.astype(np.float32),
+                posterior_relative_state=posterior_state.astype(np.float32),
+                posterior_covariance_diagonal=posterior_covariance_diagonal.astype(np.float32),
+                confidence=confidence,
+                existence_probability=confidence,
+                valid=valid,
+                local_candidate_weights=full_weights,
+                local_candidate_index=best_local_index,
+                innovation_distance=float(best_innovation_distance),
+            )
+        )
+        agent_next_states[target_idx] = BPJPDAFilterState(
+            mean=posterior_state.astype(float, copy=True),
+            covariance=posterior_covariance.astype(float, copy=True),
+            motion_state=posterior_motion_state,
+        )
+
+    return (
+        MultiTargetTrackOutput(
+            agent_id=context.agent_id,
+            tracks=tuple(agent_tracks),
+            mode="local_only",
+        ),
+        agent_next_states,
+    )
+
+
 def bp_jpda_association_for_friendlies(
     *,
     friendly_states: np.ndarray,
@@ -1721,6 +2118,289 @@ def bp_jpda_association_for_friendlies(
             mode="local_only",
         )
         next_filter_states[str(agent_id)] = agent_next_states
+    return outputs, next_filter_states
+
+
+def aa_bp_jpda_association_for_friendlies(
+    *,
+    friendly_states: np.ndarray,
+    global_target_priors: GlobalKeyTargetStatePrior,
+    local_observations: dict[str, LocalTargetObservation],
+    agent_ids: Sequence[str],
+    previous_filter_states: dict[str, dict[int, BPJPDAFilterState]] | None,
+    detection_radius_m: float,
+    relative_velocity_limit_mps: float,
+    local_detection_probability: float,
+    clutter_rate_per_second: float,
+    recursive_motion_model: str = "imm",
+    imm_model_types: Sequence[str] = ("cv", "ca", "ct_left", "ct_right"),
+    imm_model_transition_matrix: np.ndarray | Sequence[Sequence[float]] | None = None,
+    imm_initial_model_probabilities: np.ndarray | Sequence[float] | None = None,
+    dt_seconds: float,
+    gate_sigma: float = 3.0,
+    max_iterations: int = 20,
+    convergence_tol: float = 1.0e-3,
+    min_missed_detection_probability: float = 0.05,
+    survival_probability: float = 0.98,
+    birth_weight: float = 0.25,
+    process_position_std_m: np.ndarray | Sequence[float] = (2.0, 2.0, 1.0),
+    process_velocity_std_mps: np.ndarray | Sequence[float] = (1.0, 1.0, 0.5),
+    imm_turn_rate_radps: float = 0.35,
+    imm_ct_process_noise_scale: float = 1.25,
+    confidence_threshold: float = 0.1,
+    local_attention_temperature: float = 2.0,
+    cross_uav_position_scale_m: float = 8.0,
+    cross_uav_velocity_scale_mps: float = 3.0,
+    cross_uav_support_threshold: float = 0.35,
+    local_evidence_weight: float = 0.6,
+    velocity_evidence_weight: float = 0.25,
+    density_penalty_weight: float = 0.35,
+    consensus_evidence_weight: float = 0.9,
+    consensus_count_weight: float = 0.45,
+    max_log_evidence: float = 1.5,
+) -> tuple[dict[str, MultiTargetTrackOutput], dict[str, dict[int, BPJPDAFilterState]]]:
+    """Run BP-JPDA with local pair attention and cross-UAV consensus likelihood reweighting."""
+
+    friendly_array = _as_state_batch(friendly_states, name="friendly_states")
+    if friendly_array.shape[0] != len(agent_ids):
+        raise ValueError("friendly_states row count must match agent_ids length.")
+    if max_iterations <= 0:
+        raise ValueError(f"max_iterations must be > 0, got {max_iterations}.")
+    if convergence_tol <= 0.0:
+        raise ValueError(f"convergence_tol must be > 0, got {convergence_tol}.")
+    if gate_sigma <= 0.0:
+        raise ValueError(f"gate_sigma must be > 0, got {gate_sigma}.")
+
+    previous_states = previous_filter_states or {}
+    process_position_std = np.asarray(process_position_std_m, dtype=float).reshape(3)
+    process_velocity_std = np.asarray(process_velocity_std_mps, dtype=float).reshape(3)
+    local_detection_probability = float(np.clip(local_detection_probability, 0.0, 1.0))
+    missed_detection_probability = max(1.0 - local_detection_probability, float(min_missed_detection_probability))
+    confidence_threshold = float(np.clip(confidence_threshold, 0.0, 1.0))
+
+    contexts: list[_BPJPDAAgentContext] = []
+    for friendly_idx, agent_id in enumerate(agent_ids):
+        contexts.append(
+            _build_bp_jpda_context(
+                agent_id=str(agent_id),
+                friendly_state=friendly_array[friendly_idx],
+                global_target_priors=global_target_priors,
+                local_observation=local_observations[str(agent_id)],
+                previous_filter_state=previous_states.get(str(agent_id), {}),
+                detection_radius_m=detection_radius_m,
+                relative_velocity_limit_mps=relative_velocity_limit_mps,
+                local_detection_probability=local_detection_probability,
+                clutter_rate_per_second=clutter_rate_per_second,
+                recursive_motion_model=recursive_motion_model,
+                imm_model_types=imm_model_types,
+                imm_model_transition_matrix=imm_model_transition_matrix,
+                imm_initial_model_probabilities=imm_initial_model_probabilities,
+                dt_seconds=dt_seconds,
+                gate_sigma=gate_sigma,
+                missed_detection_probability=missed_detection_probability,
+                survival_probability=survival_probability,
+                birth_weight=birth_weight,
+                process_position_std=process_position_std,
+                process_velocity_std=process_velocity_std,
+                imm_turn_rate_radps=imm_turn_rate_radps,
+                imm_ct_process_noise_scale=imm_ct_process_noise_scale,
+            )
+        )
+
+    outputs: dict[str, MultiTargetTrackOutput] = {}
+    next_filter_states: dict[str, dict[int, BPJPDAFilterState]] = {}
+    for context in contexts:
+        enhanced_likelihoods = _enhance_likelihoods_with_aa_bp_jpda(
+            context=context,
+            all_contexts=contexts,
+            gate_sigma=gate_sigma,
+            local_attention_temperature=local_attention_temperature,
+            cross_uav_position_scale_m=cross_uav_position_scale_m,
+            cross_uav_velocity_scale_mps=cross_uav_velocity_scale_mps,
+            cross_uav_support_threshold=cross_uav_support_threshold,
+            local_evidence_weight=local_evidence_weight,
+            velocity_evidence_weight=velocity_evidence_weight,
+            density_penalty_weight=density_penalty_weight,
+            consensus_evidence_weight=consensus_evidence_weight,
+            consensus_count_weight=consensus_count_weight,
+            max_log_evidence=max_log_evidence,
+        )
+        marginals = _run_bp_jpda(
+            enhanced_likelihoods,
+            max_iterations=max_iterations,
+            convergence_tol=convergence_tol,
+        ) if context.valid_indices.size and context.prior_relative_states.shape[0] else np.zeros_like(enhanced_likelihoods)
+        track_output, agent_next_states = _build_bp_jpda_tracks_from_marginals(
+            context=context,
+            marginals=marginals,
+            confidence_threshold=confidence_threshold,
+        )
+        outputs[context.agent_id] = track_output
+        next_filter_states[context.agent_id] = agent_next_states
+
+    return outputs, next_filter_states
+
+
+def _sinkhorn_attention_marginals(
+    likelihood_ratios: np.ndarray,
+    *,
+    iterations: int,
+    temperature: float,
+    missed_dummy_score: float,
+) -> np.ndarray:
+    likelihoods = np.asarray(likelihood_ratios, dtype=float)
+    if likelihoods.ndim != 2:
+        raise ValueError(f"likelihood_ratios must be 2D, got {likelihoods.shape}.")
+    num_targets, num_measurements = likelihoods.shape
+    if num_targets == 0:
+        return np.zeros_like(likelihoods, dtype=float)
+
+    log_scores = np.full((num_targets + 1, num_measurements + 1), -40.0, dtype=float)
+    valid_mask = likelihoods > 0.0
+    log_scores[:num_targets, :num_measurements][valid_mask] = np.log(np.maximum(likelihoods[valid_mask], 1.0e-12))
+    log_scores[:num_targets, num_measurements] = float(missed_dummy_score)
+    if num_measurements > 0:
+        log_scores[num_targets, :num_measurements] = 0.0
+    log_scores[num_targets, num_measurements] = 0.0
+
+    row_marginals = np.concatenate(
+        [
+            np.ones(num_targets, dtype=float),
+            np.asarray([float(num_measurements)], dtype=float),
+        ]
+    )
+    column_marginals = np.concatenate(
+        [
+            np.ones(num_measurements, dtype=float),
+            np.asarray([float(num_targets)], dtype=float),
+        ]
+    )
+    transport = _run_sinkhorn(
+        log_scores,
+        row_marginals,
+        column_marginals,
+        iterations=iterations,
+        temperature=temperature,
+    )
+    marginals = transport[:num_targets, :num_measurements]
+    return np.where(valid_mask, marginals, 0.0)
+
+
+def sinkhorn_ajpda_association_for_friendlies(
+    *,
+    friendly_states: np.ndarray,
+    global_target_priors: GlobalKeyTargetStatePrior,
+    local_observations: dict[str, LocalTargetObservation],
+    agent_ids: Sequence[str],
+    previous_filter_states: dict[str, dict[int, BPJPDAFilterState]] | None,
+    detection_radius_m: float,
+    relative_velocity_limit_mps: float,
+    local_detection_probability: float,
+    clutter_rate_per_second: float,
+    recursive_motion_model: str = "imm",
+    imm_model_types: Sequence[str] = ("cv", "ca", "ct_left", "ct_right"),
+    imm_model_transition_matrix: np.ndarray | Sequence[Sequence[float]] | None = None,
+    imm_initial_model_probabilities: np.ndarray | Sequence[float] | None = None,
+    dt_seconds: float,
+    gate_sigma: float = 3.0,
+    sinkhorn_iterations: int = 30,
+    sinkhorn_temperature: float = 1.0,
+    sinkhorn_missed_dummy_score: float = -0.5,
+    min_missed_detection_probability: float = 0.05,
+    survival_probability: float = 0.98,
+    birth_weight: float = 0.25,
+    process_position_std_m: np.ndarray | Sequence[float] = (2.0, 2.0, 1.0),
+    process_velocity_std_mps: np.ndarray | Sequence[float] = (1.0, 1.0, 0.5),
+    imm_turn_rate_radps: float = 0.35,
+    imm_ct_process_noise_scale: float = 1.25,
+    confidence_threshold: float = 0.1,
+    local_attention_temperature: float = 2.0,
+    cross_uav_position_scale_m: float = 8.0,
+    cross_uav_velocity_scale_mps: float = 3.0,
+    cross_uav_support_threshold: float = 0.35,
+    local_evidence_weight: float = 0.6,
+    velocity_evidence_weight: float = 0.25,
+    density_penalty_weight: float = 0.35,
+    consensus_evidence_weight: float = 0.9,
+    consensus_count_weight: float = 0.45,
+    max_log_evidence: float = 1.5,
+) -> tuple[dict[str, MultiTargetTrackOutput], dict[str, dict[int, BPJPDAFilterState]]]:
+    """Approximate JPDA marginals with attention evidence and Sinkhorn assignment constraints."""
+
+    friendly_array = _as_state_batch(friendly_states, name="friendly_states")
+    if friendly_array.shape[0] != len(agent_ids):
+        raise ValueError("friendly_states row count must match agent_ids length.")
+    if gate_sigma <= 0.0:
+        raise ValueError(f"gate_sigma must be > 0, got {gate_sigma}.")
+
+    previous_states = previous_filter_states or {}
+    process_position_std = np.asarray(process_position_std_m, dtype=float).reshape(3)
+    process_velocity_std = np.asarray(process_velocity_std_mps, dtype=float).reshape(3)
+    local_detection_probability = float(np.clip(local_detection_probability, 0.0, 1.0))
+    missed_detection_probability = max(1.0 - local_detection_probability, float(min_missed_detection_probability))
+    confidence_threshold = float(np.clip(confidence_threshold, 0.0, 1.0))
+
+    contexts: list[_BPJPDAAgentContext] = []
+    for friendly_idx, agent_id in enumerate(agent_ids):
+        contexts.append(
+            _build_bp_jpda_context(
+                agent_id=str(agent_id),
+                friendly_state=friendly_array[friendly_idx],
+                global_target_priors=global_target_priors,
+                local_observation=local_observations[str(agent_id)],
+                previous_filter_state=previous_states.get(str(agent_id), {}),
+                detection_radius_m=detection_radius_m,
+                relative_velocity_limit_mps=relative_velocity_limit_mps,
+                local_detection_probability=local_detection_probability,
+                clutter_rate_per_second=clutter_rate_per_second,
+                recursive_motion_model=recursive_motion_model,
+                imm_model_types=imm_model_types,
+                imm_model_transition_matrix=imm_model_transition_matrix,
+                imm_initial_model_probabilities=imm_initial_model_probabilities,
+                dt_seconds=dt_seconds,
+                gate_sigma=gate_sigma,
+                missed_detection_probability=missed_detection_probability,
+                survival_probability=survival_probability,
+                birth_weight=birth_weight,
+                process_position_std=process_position_std,
+                process_velocity_std=process_velocity_std,
+                imm_turn_rate_radps=imm_turn_rate_radps,
+                imm_ct_process_noise_scale=imm_ct_process_noise_scale,
+            )
+        )
+
+    outputs: dict[str, MultiTargetTrackOutput] = {}
+    next_filter_states: dict[str, dict[int, BPJPDAFilterState]] = {}
+    for context in contexts:
+        enhanced_likelihoods = _enhance_likelihoods_with_aa_bp_jpda(
+            context=context,
+            all_contexts=contexts,
+            gate_sigma=gate_sigma,
+            local_attention_temperature=local_attention_temperature,
+            cross_uav_position_scale_m=cross_uav_position_scale_m,
+            cross_uav_velocity_scale_mps=cross_uav_velocity_scale_mps,
+            cross_uav_support_threshold=cross_uav_support_threshold,
+            local_evidence_weight=local_evidence_weight,
+            velocity_evidence_weight=velocity_evidence_weight,
+            density_penalty_weight=density_penalty_weight,
+            consensus_evidence_weight=consensus_evidence_weight,
+            consensus_count_weight=consensus_count_weight,
+            max_log_evidence=max_log_evidence,
+        )
+        marginals = _sinkhorn_attention_marginals(
+            enhanced_likelihoods,
+            iterations=sinkhorn_iterations,
+            temperature=sinkhorn_temperature,
+            missed_dummy_score=sinkhorn_missed_dummy_score,
+        ) if context.valid_indices.size and context.prior_relative_states.shape[0] else np.zeros_like(enhanced_likelihoods)
+        track_output, agent_next_states = _build_bp_jpda_tracks_from_marginals(
+            context=context,
+            marginals=marginals,
+            confidence_threshold=confidence_threshold,
+        )
+        outputs[context.agent_id] = track_output
+        next_filter_states[context.agent_id] = agent_next_states
+
     return outputs, next_filter_states
 
 

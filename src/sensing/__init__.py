@@ -5,6 +5,7 @@ from src.sensing.association import (
     KeyTrackPosterior,
     LMBFilterState,
     MultiTargetTrackOutput,
+    aa_bp_jpda_association_for_friendlies,
     association_output_to_weight_vector,
     bp_jpda_association_for_friendlies,
     empty_key_track_posterior,
@@ -14,6 +15,7 @@ from src.sensing.association import (
     gm_phd_association_for_friendlies,
     lmb_association_for_friendlies,
     nearest_local_candidate_association_for_friendlies,
+    sinkhorn_ajpda_association_for_friendlies,
 )
 from src.sensing.delta_glmb import (
     DeltaGLMBFilterState,
@@ -44,6 +46,7 @@ __all__ = [
     "KeyTrackPosterior",
     "LMBFilterState",
     "MultiTargetTrackOutput",
+    "aa_bp_jpda_association_for_friendlies",
     "association_output_to_weight_vector",
     "bp_jpda_association_for_friendlies",
     "delta_glmb_association_for_friendlies",
@@ -62,6 +65,7 @@ __all__ = [
     "LocalTargetObservation",
     "LocalTargetSensor",
     "nearest_local_candidate_association_for_friendlies",
+    "sinkhorn_ajpda_association_for_friendlies",
     "replace_key_enemy_positions",
     "replace_key_enemy_positions_for_tracking_view",
 ]

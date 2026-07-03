@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import time
 from pathlib import Path
 
 import numpy as np
@@ -9,13 +10,14 @@ import numpy as np
 from src.entities.friendly_uav import FriendlyUAV
 from src.env.swarm_env import SwarmEnv
 from src.simulation.trajectory_generator import TrajectoryBundle
-from src.tracking.metrics import export_key_target_metrics_csv
+from src.tracking.metrics import export_key_target_metrics_csv, summarize_key_target_tracking_episode
 from src.utils.config_loader import (
     get_default_seed,
     get_num_friendly_uavs,
     get_num_key_targets,
     get_num_nonkey_targets,
     get_num_steps,
+    get_selected_scenario_name,
     get_tracking_association_method,
     get_simulation_dt,
 )
@@ -30,6 +32,8 @@ def _association_method_suffix(association_method: str) -> str:
     suffix_by_method = {
         "none": "none",
         "bp_jpda": "bpjpda",
+        "aa_bp_jpda": "aabpjpda",
+        "sinkhorn_ajpda": "sinkhornajpda",
         "gm_phd": "gmphd",
         "lmb": "lmb",
         "delta_glmb": "dglmb",
@@ -37,11 +41,12 @@ def _association_method_suffix(association_method: str) -> str:
     return suffix_by_method.get(str(association_method).lower(), str(association_method).lower())
 
 
-def _key_distance_figure_paths(scene, base_path: Path) -> list[Path]:
-    key_labels = [f"E{idx + 1}" for idx, node in enumerate(scene.enemy_nodes) if node.role == "key"]
-    if not key_labels:
-        return []
-    return [base_path.with_name(f"{base_path.stem}_{label}{base_path.suffix}") for label in key_labels]
+def _scenario_output_name() -> str:
+    selected_scenario = get_selected_scenario_name()
+    if selected_scenario is None:
+        return "default_scenario"
+    scenario_name = str(selected_scenario).strip()
+    return scenario_name or "default_scenario"
 
 
 def export_position_timeseries_csv(scene, trajectories, save_path: str | Path) -> Path:
@@ -82,7 +87,7 @@ def _capture_key_target_tracking_state(
     env: SwarmEnv,
     *,
     num_key_targets: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
     if env.world is None:
         raise RuntimeError("reset() must be called before capturing key-target tracking state.")
 
@@ -96,7 +101,9 @@ def _capture_key_target_tracking_state(
     state_dim = int(truth_states.shape[1]) if truth_states.ndim == 2 and truth_states.size > 0 else 6
     fused_state_means = np.full((num_key_targets, state_dim), np.nan, dtype=float)
     fused_valid_mask = np.zeros(num_key_targets, dtype=bool)
+    inference_start = time.perf_counter()
     fused_track_set = env.get_fused_track_set()
+    inference_time_s = time.perf_counter() - inference_start
     for track in fused_track_set.tracks:
         target_idx = int(track.global_target_index)
         if target_idx < 0 or target_idx >= num_key_targets or not bool(track.valid):
@@ -104,7 +111,7 @@ def _capture_key_target_tracking_state(
         track_state = np.asarray(track.fused_state_mean, dtype=float).reshape(-1)
         fused_state_means[target_idx, : min(state_dim, track_state.shape[0])] = track_state[:state_dim]
         fused_valid_mask[target_idx] = True
-    return truth_states.copy(), fused_state_means, fused_valid_mask
+    return truth_states.copy(), fused_state_means, fused_valid_mask, float(inference_time_s)
 
 
 def rollout_tracking_episode(
@@ -113,7 +120,7 @@ def rollout_tracking_episode(
     nonkey_num: int | None = None,
     mydrone_num: int | None = None,
     seed: int | None = None,
-) -> tuple[object, TrajectoryBundle, np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[object, TrajectoryBundle, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     resolved_seed = get_default_seed() if seed is None else int(seed)
     resolved_key_num = get_num_key_targets() if key_num is None else int(key_num)
     resolved_nonkey_num = get_num_nonkey_targets() if nonkey_num is None else int(nonkey_num)
@@ -146,6 +153,7 @@ def rollout_tracking_episode(
     key_truth_states = np.zeros((num_steps + 1, num_key_enemies, state_dim), dtype=float)
     fused_key_state_means = np.full((num_steps + 1, num_key_enemies, state_dim), np.nan, dtype=float)
     fused_key_valid_mask = np.zeros((num_steps + 1, num_key_enemies), dtype=bool)
+    tracking_inference_time_s = np.zeros(num_steps + 1, dtype=float)
 
     enemy_positions[0] = env.world.get_enemy_positions()
     friendly_positions[0] = env.world.get_friendly_positions()
@@ -153,7 +161,12 @@ def rollout_tracking_episode(
     key_enemy_interference_dbm[0] = env.world.interference.key_enemy_received_dbm
     friendly_interference_watts[0] = env.world.interference.friendly_received_watts
     friendly_interference_dbm[0] = env.world.interference.friendly_received_dbm
-    key_truth_states[0], fused_key_state_means[0], fused_key_valid_mask[0] = _capture_key_target_tracking_state(
+    (
+        key_truth_states[0],
+        fused_key_state_means[0],
+        fused_key_valid_mask[0],
+        tracking_inference_time_s[0],
+    ) = _capture_key_target_tracking_state(
         env,
         num_key_targets=num_key_enemies,
     )
@@ -177,6 +190,7 @@ def rollout_tracking_episode(
             key_truth_states[step_idx],
             fused_key_state_means[step_idx],
             fused_key_valid_mask[step_idx],
+            tracking_inference_time_s[step_idx],
         ) = _capture_key_target_tracking_state(
             env,
             num_key_targets=num_key_enemies,
@@ -193,7 +207,7 @@ def rollout_tracking_episode(
         dt=float(env.dt),
         bounds=env.world.bounds.copy(),
     )
-    return env.scene, bundle, key_truth_states, fused_key_state_means, fused_key_valid_mask
+    return env.scene, bundle, key_truth_states, fused_key_state_means, fused_key_valid_mask, tracking_inference_time_s
 
 
 def export_tracking_rollout(
@@ -205,7 +219,14 @@ def export_tracking_rollout(
     nonkey_num: int | None = None,
     mydrone_num: int | None = None,
 ) -> dict[str, Path | list[Path]]:
-    scene, trajectories, key_truth_states, fused_key_state_means, fused_key_valid_mask = rollout_tracking_episode(
+    (
+        scene,
+        trajectories,
+        key_truth_states,
+        fused_key_state_means,
+        fused_key_valid_mask,
+        tracking_inference_time_s,
+    ) = rollout_tracking_episode(
         key_num=key_num,
         nonkey_num=nonkey_num,
         mydrone_num=mydrone_num,
@@ -213,8 +234,9 @@ def export_tracking_rollout(
     )
     association_method = str(get_tracking_association_method()).lower()
     association_suffix = _association_method_suffix(get_tracking_association_method())
+    scenario_name = _scenario_output_name()
 
-    output_root = Path(output_dir) / association_method
+    output_root = Path(output_dir) / scenario_name / association_method
     output_root.mkdir(parents=True, exist_ok=True)
 
     trajectory_npz = output_root / "tracking_rollout_episode.npz"
@@ -222,8 +244,7 @@ def export_tracking_rollout(
     trajectory_pdf = output_root / "tracking_rollout_all_trajectories.pdf"
     positions_csv = output_root / f"tracking_rollout_positions_{association_suffix}.csv"
     metrics_csv = output_root / f"tracking_rollout_key_target_metrics_{association_suffix}.csv"
-    key_distance_pdf = output_root / "tracking_rollout_key_enemy_nearest_friendly_distance.pdf"
-    key_distance_pdfs = _key_distance_figure_paths(scene, key_distance_pdf)
+    key_distance_pdf = output_root / "tracking_rollout_key_enemy_nearest_friendly_distances_combined.pdf"
 
     np.savez(
         trajectory_npz,
@@ -237,6 +258,7 @@ def export_tracking_rollout(
         key_truth_states=key_truth_states,
         fused_key_state_means=fused_key_state_means,
         fused_key_valid_mask=fused_key_valid_mask,
+        tracking_inference_time_s=tracking_inference_time_s,
         dt=np.asarray(trajectories.dt),
         bounds=trajectories.bounds,
     )
@@ -268,12 +290,20 @@ def export_tracking_rollout(
         dt=float(trajectories.dt),
         bounds=trajectories.bounds,
         save_path=metrics_csv,
+        inference_time_s=tracking_inference_time_s,
+    )
+    cutoff_distance = float(np.asarray(trajectories.bounds, dtype=float).reshape(-1)[0]) / 4.0
+    tracking_summary = summarize_key_target_tracking_episode(
+        truth_states=key_truth_states,
+        estimated_states=fused_key_state_means,
+        valid_mask=fused_key_valid_mask,
+        cutoff_distance=cutoff_distance,
+        order=2,
     )
     plot_key_enemy_nearest_friendly_distance_curves(
         scene=scene,
         trajectories=trajectories,
         save_path=key_distance_pdf,
-        title="Tracking Rollout Key Enemy Nearest Friendly Distance",
         show=show,
     )
 
@@ -282,8 +312,33 @@ def export_tracking_rollout(
     print(f"Saved combined trajectory figure: {trajectory_pdf}")
     print(f"Saved position/action CSV: {positions_csv}")
     print(f"Saved key-target metrics CSV: {metrics_csv}")
-    for figure_path in key_distance_pdfs:
-        print(f"Saved key enemy nearest-friendly distance figure: {figure_path}")
+    print(
+        "Key-target tracking coverage by step: "
+        + np.array2string(
+            np.asarray(tracking_summary["tracked_counts"], dtype=int),
+            separator=", ",
+        )
+        + " / "
+        + str(key_truth_states.shape[1])
+    )
+    print(
+        "Tracking summary: "
+        f"mean_ospa={float(tracking_summary['mean_ospa']):.3f} m, "
+        f"final_ospa={float(tracking_summary['final_ospa']):.3f} m, "
+        f"mean_gospa={float(tracking_summary['mean_gospa']):.3f} m, "
+        f"final_gospa={float(tracking_summary['final_gospa']):.3f} m, "
+        f"mean_rmse={float(tracking_summary['mean_rmse']):.3f} m, "
+        f"mean_coverage={100.0 * float(tracking_summary['mean_tracked_ratio']):.1f}%, "
+        f"final_coverage={int(tracking_summary['final_tracked_count'])}/{key_truth_states.shape[1]}, "
+        f"id_switches={int(tracking_summary['total_id_switches'])}, "
+        f"fragmentations={int(tracking_summary['total_fragmentations'])}"
+    )
+    print(
+        "Tracking inference time: "
+        f"mean={float(np.mean(tracking_inference_time_s)):.6f} s/step, "
+        f"total={float(np.sum(tracking_inference_time_s)):.6f} s"
+    )
+    print(f"Saved key enemy nearest-friendly distance figure: {key_distance_pdf}")
 
     return {
         "trajectory_npz": trajectory_npz,
@@ -291,7 +346,7 @@ def export_tracking_rollout(
         "trajectory_pdf": trajectory_pdf,
         "positions_csv": positions_csv,
         "metrics_csv": metrics_csv,
-        "key_distance_pdfs": key_distance_pdfs,
+        "key_distance_pdf": key_distance_pdf,
     }
 
 
