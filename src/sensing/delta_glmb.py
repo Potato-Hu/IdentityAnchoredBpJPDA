@@ -17,9 +17,13 @@ from src.sensing.association import (
     _collapse_motion_state,
     _gaussian_mixture_moments,
     _gaussian_pdf_zero_mean_diag,
+    _is_filter_state_expired,
     _merge_motion_hypotheses,
     _nearest_measurement_support,
+    _next_missed_count,
     _position_gate_margin,
+    _previous_missed_count,
+    _sanitize_max_missed_steps,
     _update_motion_state_with_measurement,
     _validate_local_observation,
     empty_multi_target_track_output,
@@ -34,6 +38,7 @@ class DeltaGLMBTrackState:
     mean: np.ndarray
     covariance: np.ndarray
     motion_state: IMMMotionState | None = None
+    missed_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -118,6 +123,7 @@ def _predict_hypotheses(
     imm_turn_rate_radps: float,
     imm_ct_process_noise_scale: float,
     max_hypotheses: int,
+    max_missed_steps: int,
 ) -> tuple[DeltaGLMBHypothesis, ...]:
     base_hypotheses = previous_filter_state.hypotheses if previous_filter_state is not None else tuple()
     if not base_hypotheses:
@@ -135,6 +141,8 @@ def _predict_hypotheses(
         predicted_track_states: list[DeltaGLMBTrackState] = []
         for target_idx in range(prior_relative_states.shape[0]):
             previous_track_state = hypothesis.track_states[target_idx] if target_idx < len(hypothesis.track_states) else None
+            if _is_filter_state_expired(previous_track_state, max_missed_steps):
+                previous_track_state = None
             previous_filter = None
             previous_existence = 0.0
             if previous_track_state is not None:
@@ -142,6 +150,7 @@ def _predict_hypotheses(
                     mean=np.asarray(previous_track_state.mean, dtype=float).copy(),
                     covariance=np.asarray(previous_track_state.covariance, dtype=float).copy(),
                     motion_state=previous_track_state.motion_state,
+                    missed_count=previous_track_state.missed_count,
                 )
                 previous_existence = float(previous_track_state.existence_probability)
 
@@ -177,6 +186,7 @@ def _predict_hypotheses(
                     mean=predicted_mean.astype(float, copy=True),
                     covariance=predicted_covariance.astype(float, copy=True),
                     motion_state=predicted_motion_state,
+                    missed_count=_previous_missed_count(previous_track_state),
                 )
             )
 
@@ -204,6 +214,7 @@ def _build_target_branches(
     local_detection_probability: float,
     clutter_intensity: float,
     gate_sigma: float,
+    max_missed_steps: int,
 ) -> list[_AssociationBranch]:
     predicted_mean = np.asarray(predicted_track_state.mean, dtype=float).reshape(STATE_DIM)
     predicted_covariance = np.asarray(predicted_track_state.covariance, dtype=float).reshape(STATE_DIM, STATE_DIM)
@@ -227,6 +238,11 @@ def _build_target_branches(
                     mean=predicted_mean.astype(float, copy=True),
                     covariance=predicted_covariance.astype(float, copy=True),
                     motion_state=predicted_motion_state,
+                    missed_count=_next_missed_count(
+                        predicted_track_state.missed_count,
+                        has_measurement_support=False,
+                        max_missed_steps=max_missed_steps,
+                    ),
                 ),
                 candidate_offset=-1,
                 innovation_distance=np.inf,
@@ -250,6 +266,11 @@ def _build_target_branches(
                 mean=predicted_mean.astype(float, copy=True),
                 covariance=predicted_covariance.astype(float, copy=True),
                 motion_state=predicted_motion_state,
+                missed_count=_next_missed_count(
+                    predicted_track_state.missed_count,
+                    has_measurement_support=False,
+                    max_missed_steps=max_missed_steps,
+                ),
             ),
             candidate_offset=-1,
             innovation_distance=np.inf,
@@ -295,6 +316,7 @@ def _build_target_branches(
                     mean=updated_mean.astype(float, copy=True),
                     covariance=updated_covariance.astype(float, copy=True),
                     motion_state=updated_motion_state,
+                    missed_count=0,
                 ),
                 candidate_offset=int(gated_offset),
                 innovation_distance=float(innovation_distance),
@@ -358,6 +380,7 @@ def _aggregate_track_posteriors(
     local_relative_states: np.ndarray,
     valid_indices: np.ndarray,
     confidence_threshold: float,
+    max_missed_steps: int,
 ) -> tuple[tuple[KeyTrackPosterior, ...], dict[int, DeltaGLMBTrackState]]:
     if prior_relative_states.shape[0] == 0:
         return tuple(), {}
@@ -370,6 +393,7 @@ def _aggregate_track_posteriors(
         mixture_covariances: list[np.ndarray] = []
         mixture_motion_states: list[IMMMotionState] = []
         mixture_weights: list[float] = []
+        mixture_missed_counts: list[int] = []
         detection_weight = 0.0
         innovation_weighted_sum = 0.0
 
@@ -382,6 +406,7 @@ def _aggregate_track_posteriors(
                 if track_state.motion_state is not None:
                     mixture_motion_states.append(track_state.motion_state)
                 mixture_weights.append(marginal_weight)
+                mixture_missed_counts.append(_previous_missed_count(track_state))
             candidate_offset = int(hypothesis.assigned_candidate_offsets[target_idx])
             if candidate_offset >= 0 and candidate_offset < len(valid_indices):
                 local_index = int(valid_indices[candidate_offset])
@@ -411,6 +436,12 @@ def _aggregate_track_posteriors(
             posterior_motion_state = None
 
         confidence = float(np.clip(detection_weight, 0.0, 1.0))
+        if confidence > 0.0:
+            collapsed_missed_count = 0
+        elif mixture_missed_counts:
+            collapsed_missed_count = min(max(mixture_missed_counts), _sanitize_max_missed_steps(max_missed_steps))
+        else:
+            collapsed_missed_count = _sanitize_max_missed_steps(max_missed_steps)
         best_local_index = -1
         best_innovation_distance = np.inf
         if np.any(full_weights > 0.0):
@@ -450,6 +481,7 @@ def _aggregate_track_posteriors(
             mean=np.asarray(posterior_mean, dtype=float).copy(),
             covariance=np.asarray(posterior_covariance, dtype=float).copy(),
             motion_state=posterior_motion_state,
+            missed_count=collapsed_missed_count,
         )
 
     return tuple(output_tracks), collapsed_track_states
@@ -481,6 +513,7 @@ def delta_glmb_association_for_friendlies(
     confidence_threshold: float = 0.1,
     max_hypotheses: int = 48,
     hypothesis_weight_prune_threshold: float = 1.0e-4,
+    max_missed_steps: int = 5,
 ) -> tuple[dict[str, MultiTargetTrackOutput], dict[str, DeltaGLMBFilterState]]:
     """Run a compact delta-GLMB-style single-sensor baseline for each friendly UAV."""
 
@@ -537,6 +570,7 @@ def delta_glmb_association_for_friendlies(
             imm_turn_rate_radps=imm_turn_rate_radps,
             imm_ct_process_noise_scale=imm_ct_process_noise_scale,
             max_hypotheses=max_hypotheses,
+            max_missed_steps=max_missed_steps,
         )
 
         updated_hypotheses: list[DeltaGLMBHypothesis] = []
@@ -550,6 +584,7 @@ def delta_glmb_association_for_friendlies(
                     local_detection_probability=local_detection_probability,
                     clutter_intensity=clutter_intensity,
                     gate_sigma=gate_sigma,
+                    max_missed_steps=max_missed_steps,
                 )
                 for target_idx in range(len(predicted_hypothesis.track_states))
             ]
@@ -579,6 +614,7 @@ def delta_glmb_association_for_friendlies(
             local_relative_states=local_relative_states,
             valid_indices=valid_indices,
             confidence_threshold=confidence_threshold,
+            max_missed_steps=max_missed_steps,
         )
         outputs[str(agent_id)] = MultiTargetTrackOutput(
             agent_id=str(agent_id),

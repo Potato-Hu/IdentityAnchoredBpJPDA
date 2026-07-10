@@ -69,6 +69,7 @@ class GMPHDFilterState:
     """Persistent GM-PHD mixture carried across environment steps for one UAV."""
 
     components: tuple[GMPHDComponent, ...]
+    missed_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -78,6 +79,7 @@ class BPJPDAFilterState:
     mean: np.ndarray
     covariance: np.ndarray
     motion_state: IMMMotionState | None = None
+    missed_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -88,6 +90,7 @@ class LMBFilterState:
     mean: np.ndarray
     covariance: np.ndarray
     motion_state: IMMMotionState | None = None
+    missed_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -105,6 +108,27 @@ class _BPJPDAAgentContext:
     predicted_motion_states: tuple[IMMMotionState, ...]
     track_active: np.ndarray
     likelihood_ratios: np.ndarray
+    previous_missed_counts: np.ndarray
+
+
+def _sanitize_max_missed_steps(max_missed_steps: int) -> int:
+    return max(int(max_missed_steps), 1)
+
+
+def _previous_missed_count(filter_state: object | None) -> int:
+    if filter_state is None:
+        return 0
+    return max(int(getattr(filter_state, "missed_count", 0)), 0)
+
+
+def _is_filter_state_expired(filter_state: object | None, max_missed_steps: int) -> bool:
+    return filter_state is not None and _previous_missed_count(filter_state) >= _sanitize_max_missed_steps(max_missed_steps)
+
+
+def _next_missed_count(previous_count: int, *, has_measurement_support: bool, max_missed_steps: int) -> int:
+    if has_measurement_support:
+        return 0
+    return min(max(int(previous_count), 0) + 1, _sanitize_max_missed_steps(max_missed_steps))
 
 
 def _as_state_batch(states: np.ndarray, *, name: str) -> np.ndarray:
@@ -165,6 +189,15 @@ def _gaussian_pdf_zero_mean_diag(samples: np.ndarray, covariance_diagonal: Seque
     squared_mahalanobis = np.sum(np.square(samples) / covariance_vector.reshape(1, -1), axis=1)
     normalizer = np.sqrt(np.power(2.0 * np.pi, samples.shape[1]) * np.prod(covariance_vector))
     return np.exp(-0.5 * squared_mahalanobis) / normalizer
+
+
+def _gaussian_kernel_zero_mean_diag(samples: np.ndarray, covariance_diagonal: Sequence[float]) -> np.ndarray:
+    covariance_vector = _as_covariance_diagonal(covariance_diagonal, name="covariance_diagonal")
+    sample_array = np.asarray(samples, dtype=float)
+    if sample_array.size == 0:
+        return np.zeros(sample_array.shape[0], dtype=float)
+    squared_mahalanobis = np.sum(np.square(sample_array) / covariance_vector.reshape(1, -1), axis=1)
+    return np.exp(-0.5 * squared_mahalanobis)
 
 
 def _gaussian_pdf(mean: np.ndarray, covariance: np.ndarray, sample: np.ndarray) -> float:
@@ -1042,6 +1075,19 @@ def _build_prior_relative_states(
     return prior_relative_states, prior_covariance
 
 
+def _global_prior_valid_mask(global_target_priors: GlobalKeyTargetStatePrior, *, length: int) -> np.ndarray:
+    raw_mask = getattr(global_target_priors, "valid_mask", None)
+    if raw_mask is None:
+        return np.ones(length, dtype=bool)
+    valid_mask = np.asarray(raw_mask, dtype=bool).reshape(-1)
+    if valid_mask.shape != (length,):
+        raise ValueError(
+            "global_target_priors.valid_mask length must match states rows, "
+            f"got {valid_mask.shape[0]} and {length}."
+        )
+    return valid_mask
+
+
 def empty_key_track_posterior(
     *,
     global_target_index: int,
@@ -1184,6 +1230,7 @@ def _bp_jpda_predict_track_state(
     previous_filter_state: BPJPDAFilterState | None,
     prior_relative_state: np.ndarray,
     prior_covariance_diagonal: np.ndarray,
+    prior_available: bool = True,
     recursive_motion_model: str,
     imm_model_types: Sequence[str],
     imm_model_transition_matrix: np.ndarray | Sequence[Sequence[float]] | None,
@@ -1230,6 +1277,10 @@ def _bp_jpda_predict_track_state(
         imm_turn_rate_radps=imm_turn_rate_radps,
         imm_ct_process_noise_scale=imm_ct_process_noise_scale,
     )
+    if not bool(prior_available):
+        predicted_mean, predicted_covariance = _collapse_motion_state(propagated_motion_state)
+        return predicted_mean, predicted_covariance, propagated_motion_state
+
     anchored_motion_state = _anchor_motion_state(
         propagated_motion_state,
         anchor_mean=anchor_mean,
@@ -1486,12 +1537,13 @@ def nearest_local_candidate_association_for_friendlies(
             friendly_array[friendly_idx],
             global_target_priors,
         )
+        prior_valid_mask = _global_prior_valid_mask(global_target_priors, length=prior_relative_states.shape[0])
         local_relative_states, local_mask, local_covariance = _validate_local_observation(local_observations[str(agent_id)])
         valid_indices = np.flatnonzero(local_mask > 0.0)
         tracks: list[KeyTrackPosterior] = []
         for target_idx in range(prior_relative_states.shape[0]):
             prior_relative_state = prior_relative_states[target_idx]
-            if valid_indices.size == 0:
+            if not bool(prior_valid_mask[target_idx]) or valid_indices.size == 0:
                 tracks.append(
                     empty_key_track_posterior(
                         global_target_index=target_idx,
@@ -1554,24 +1606,37 @@ def _build_bp_jpda_context(
     process_velocity_std: np.ndarray,
     imm_turn_rate_radps: float,
     imm_ct_process_noise_scale: float,
+    max_missed_steps: int = 5,
+    anchor_to_global_prior: bool = False,
 ) -> _BPJPDAAgentContext:
     friendly = _as_state_vector(friendly_state, name="friendly_state")
     prior_relative_states, prior_covariance = _build_prior_relative_states(
         friendly,
         global_target_priors,
     )
+    prior_valid_mask = _global_prior_valid_mask(global_target_priors, length=prior_relative_states.shape[0])
     local_relative_states, local_mask, local_covariance = _validate_local_observation(local_observation)
     valid_indices = np.flatnonzero(local_mask > 0.0)
 
     predicted_means: list[np.ndarray] = []
     predicted_covariances: list[np.ndarray] = []
     predicted_motion_states: list[IMMMotionState] = []
+    previous_missed_counts: list[int] = []
     track_active = np.ones(prior_relative_states.shape[0], dtype=bool)
     for target_idx in range(prior_relative_states.shape[0]):
+        previous_track_state = previous_filter_state.get(target_idx)
+        if _is_filter_state_expired(previous_track_state, max_missed_steps):
+            previous_track_state = None
+        prior_available = bool(prior_valid_mask[target_idx])
+        if not prior_available and previous_track_state is None:
+            track_active[target_idx] = False
+        previous_missed_counts.append(_previous_missed_count(previous_track_state))
+        prediction_previous_state = None if bool(anchor_to_global_prior and prior_available) else previous_track_state
         predicted_mean, predicted_covariance, predicted_motion_state = _bp_jpda_predict_track_state(
-            previous_filter_state=previous_filter_state.get(target_idx),
+            previous_filter_state=prediction_previous_state,
             prior_relative_state=prior_relative_states[target_idx],
             prior_covariance_diagonal=prior_covariance,
+            prior_available=prior_available,
             recursive_motion_model=recursive_motion_model,
             imm_model_types=imm_model_types,
             imm_model_transition_matrix=imm_model_transition_matrix,
@@ -1587,6 +1652,8 @@ def _build_bp_jpda_context(
         predicted_means.append(predicted_mean)
         predicted_covariances.append(predicted_covariance)
         predicted_motion_states.append(predicted_motion_state)
+        if not prior_available:
+            prior_relative_states[target_idx] = predicted_mean
         innovation_covariance_diagonal = np.diag(predicted_covariance) + local_covariance
         prior_position_distance = float(np.linalg.norm(predicted_mean[:3]))
         if prior_position_distance > float(detection_radius_m) + _position_gate_margin(
@@ -1641,6 +1708,7 @@ def _build_bp_jpda_context(
         predicted_motion_states=tuple(predicted_motion_states),
         track_active=track_active,
         likelihood_ratios=likelihood_ratios,
+        previous_missed_counts=np.asarray(previous_missed_counts, dtype=int),
     )
 
 
@@ -1680,43 +1748,6 @@ def _normalized_entropy(probabilities: np.ndarray) -> float:
     clipped = np.maximum(values, 1.0e-12)
     entropy = -float(np.sum(clipped * np.log(clipped)))
     return float(np.clip(entropy / np.log(float(values.size)), 0.0, 1.0))
-
-
-def _run_sinkhorn(
-    log_scores: np.ndarray,
-    row_marginals: np.ndarray,
-    column_marginals: np.ndarray,
-    *,
-    iterations: int,
-    temperature: float,
-) -> np.ndarray:
-    scores = np.asarray(log_scores, dtype=float)
-    rows = np.asarray(row_marginals, dtype=float).reshape(-1)
-    columns = np.asarray(column_marginals, dtype=float).reshape(-1)
-    if scores.shape != (rows.shape[0], columns.shape[0]):
-        raise ValueError(
-            "log_scores shape must match row and column marginals, "
-            f"got {scores.shape}, {rows.shape}, and {columns.shape}."
-        )
-    if iterations <= 0:
-        raise ValueError(f"iterations must be > 0, got {iterations}.")
-    if temperature <= 0.0:
-        raise ValueError(f"temperature must be > 0, got {temperature}.")
-
-    row_total = float(np.sum(rows))
-    column_total = float(np.sum(columns))
-    if row_total <= 0.0 or column_total <= 0.0:
-        return np.zeros_like(scores, dtype=float)
-    columns = columns * (row_total / column_total)
-
-    kernel = np.exp(np.clip(scores / float(temperature), -40.0, 40.0))
-    kernel = np.maximum(kernel, 1.0e-12)
-    for _ in range(int(iterations)):
-        row_sums = np.sum(kernel, axis=1)
-        kernel *= (rows / np.maximum(row_sums, 1.0e-12)).reshape(-1, 1)
-        column_sums = np.sum(kernel, axis=0)
-        kernel *= (columns / np.maximum(column_sums, 1.0e-12)).reshape(1, -1)
-    return kernel
 
 
 def _enhance_likelihoods_with_aa_bp_jpda(
@@ -1819,11 +1850,227 @@ def _enhance_likelihoods_with_aa_bp_jpda(
     return enhanced
 
 
+def _candidate_local_likelihoods_for_prior(
+    context: _BPJPDAAgentContext,
+    *,
+    pose_covariance_diagonal: np.ndarray,
+    prior_covariance_inflation: float,
+    fused_anchor_states: np.ndarray | None = None,
+    fused_anchor_covariances: np.ndarray | None = None,
+    fused_anchor_valid_mask: np.ndarray | None = None,
+) -> np.ndarray:
+    likelihoods = np.zeros_like(context.likelihood_ratios, dtype=float)
+    if context.candidate_states.shape[0] == 0:
+        return likelihoods
+
+    pose_covariance = _as_covariance_diagonal(pose_covariance_diagonal, name="pose_covariance_diagonal")
+    prior_covariance = _as_covariance_diagonal(context.prior_covariance, name="context.prior_covariance")
+    fused_states = None if fused_anchor_states is None else _as_state_batch(fused_anchor_states, name="fused_anchor_states")
+    fused_valid = None if fused_anchor_valid_mask is None else np.asarray(fused_anchor_valid_mask, dtype=bool).reshape(-1)
+    fused_covariances = None
+    if fused_anchor_covariances is not None:
+        fused_covariances = np.asarray(fused_anchor_covariances, dtype=float)
+        if fused_covariances.ndim != 3 or fused_covariances.shape[1:] != (STATE_DIM, STATE_DIM):
+            raise ValueError(
+                "fused_anchor_covariances must have shape "
+                f"(N, {STATE_DIM}, {STATE_DIM}), got {fused_covariances.shape}."
+            )
+    for target_idx in range(likelihoods.shape[0]):
+        if not context.track_active[target_idx]:
+            continue
+
+        prior_anchor_covariance = (
+            context.local_covariance
+            + pose_covariance
+            + (1.0 + max(float(prior_covariance_inflation), 0.0)) * prior_covariance
+        )
+        prior_anchor_residuals = context.candidate_states - context.prior_relative_states[target_idx].reshape(1, STATE_DIM)
+        anchor_likelihood = _gaussian_kernel_zero_mean_diag(prior_anchor_residuals, prior_anchor_covariance)
+
+        if (
+            fused_states is not None
+            and fused_covariances is not None
+            and fused_valid is not None
+            and target_idx < fused_states.shape[0]
+            and target_idx < fused_covariances.shape[0]
+            and target_idx < fused_valid.shape[0]
+            and bool(fused_valid[target_idx])
+        ):
+            fused_relative_anchor = fused_states[target_idx] - context.friendly_state
+            fused_anchor_covariance = (
+                np.diag(_as_covariance_matrix(fused_covariances[target_idx], name="fused_anchor_covariance"))
+                + context.local_covariance
+                + pose_covariance
+            )
+            fused_anchor_residuals = context.candidate_states - fused_relative_anchor.reshape(1, STATE_DIM)
+            fused_likelihood = _gaussian_kernel_zero_mean_diag(fused_anchor_residuals, fused_anchor_covariance)
+            anchor_likelihood = np.maximum(anchor_likelihood, fused_likelihood)
+
+        likelihoods[target_idx] = anchor_likelihood
+    return likelihoods
+
+
+def _chi_square_threshold(*, dimensions: int, confidence: float) -> float:
+    dim = int(dimensions)
+    conf = float(confidence)
+    known_thresholds = {
+        (2, 0.95): 5.991464547107979,
+        (3, 0.95): 7.814727903251179,
+    }
+    rounded_conf = round(conf, 6)
+    threshold = known_thresholds.get((dim, rounded_conf))
+    if threshold is not None:
+        return threshold
+    if dim == 2:
+        return known_thresholds[(2, 0.95)]
+    return known_thresholds[(3, 0.95)]
+
+
+def _prior_mass_pruning_mask(candidate_prior: np.ndarray, *, mass_ratio: float) -> np.ndarray:
+    priors = np.asarray(candidate_prior, dtype=float).reshape(-1)
+    if priors.size == 0:
+        return np.zeros(0, dtype=bool)
+    total_mass = float(np.sum(np.maximum(priors, 0.0)))
+    if total_mass <= 0.0:
+        return np.zeros(priors.shape, dtype=bool)
+
+    target_mass = float(np.clip(mass_ratio, 0.0, 1.0)) * total_mass
+    order = np.argsort(-priors)
+    cumulative_mass = np.cumsum(np.maximum(priors[order], 0.0))
+    keep_count = int(np.searchsorted(cumulative_mass, target_mass, side="left")) + 1
+    keep_count = min(max(keep_count, 1), priors.size)
+    mask = np.zeros(priors.shape, dtype=bool)
+    mask[order[:keep_count]] = True
+    return mask
+
+
+def _cooperative_prior_reweighted_likelihoods(
+    *,
+    context: _BPJPDAAgentContext,
+    all_contexts: Sequence[_BPJPDAAgentContext],
+    local_likelihoods_by_agent: dict[str, np.ndarray],
+    detection_radius_m: float,
+    pose_covariance_diagonal: np.ndarray,
+    time_sync_covariance_diagonal: np.ndarray,
+    clutter_likelihood: float,
+    min_prior: float,
+    max_prior: float,
+    normalize_target_mean: bool,
+    adaptive_pruning_enabled: bool,
+    pruning_chi_square_confidence: float,
+    pruning_mass_ratio: float,
+    pruning_position_dimensions: int,
+) -> np.ndarray:
+    reweighted = np.asarray(context.likelihood_ratios, dtype=float).copy()
+    if reweighted.size == 0:
+        return reweighted
+
+    local_likelihoods = local_likelihoods_by_agent.get(context.agent_id)
+    if local_likelihoods is None or local_likelihoods.shape != reweighted.shape:
+        return reweighted
+
+    pose_covariance = _as_covariance_diagonal(pose_covariance_diagonal, name="pose_covariance_diagonal")
+    time_sync_covariance = _as_covariance_diagonal(
+        time_sync_covariance_diagonal,
+        name="time_sync_covariance_diagonal",
+    )
+    min_prior_value = max(float(min_prior), 0.0)
+    max_prior_value = max(float(max_prior), min_prior_value + 1.0e-9)
+    clutter_floor = max(float(clutter_likelihood), 1.0e-12)
+    pruning_dims = int(np.clip(int(pruning_position_dimensions), 2, 3))
+    pruning_chi_square = _chi_square_threshold(
+        dimensions=pruning_dims,
+        confidence=float(pruning_chi_square_confidence),
+    )
+    candidate_global_states = context.friendly_state.reshape(1, STATE_DIM) + context.candidate_states
+
+    for target_idx in range(reweighted.shape[0]):
+        active_offsets = np.flatnonzero(reweighted[target_idx] > 0.0)
+        if active_offsets.size == 0:
+            continue
+
+        target_denominator = np.sum(local_likelihoods[:, active_offsets], axis=0) + clutter_floor
+        uniqueness = local_likelihoods[target_idx, active_offsets] / np.maximum(target_denominator, 1.0e-12)
+        cooperative_support = np.ones(active_offsets.size, dtype=float)
+        active_global_states = candidate_global_states[active_offsets]
+
+        for other_context in all_contexts:
+            if other_context.agent_id == context.agent_id:
+                continue
+            if target_idx >= other_context.likelihood_ratios.shape[0] or other_context.candidate_states.shape[0] == 0:
+                continue
+            other_likelihoods = local_likelihoods_by_agent.get(other_context.agent_id)
+            if other_likelihoods is None or target_idx >= other_likelihoods.shape[0]:
+                continue
+
+            coverage_margin = _position_gate_margin(
+                context.local_covariance + other_context.local_covariance + 2.0 * pose_covariance,
+                3.0,
+            )
+            covered_by_other = (
+                np.linalg.norm(active_global_states[:, :3] - other_context.friendly_state.reshape(1, STATE_DIM)[:, :3], axis=1)
+                <= float(detection_radius_m) + coverage_margin
+            )
+            if not np.any(covered_by_other):
+                continue
+
+            other_global_states = other_context.friendly_state.reshape(1, STATE_DIM) + other_context.candidate_states
+            pairwise_residuals = (
+                active_global_states[:, None, :] - other_global_states[None, :, :]
+            ).reshape(-1, STATE_DIM)
+            support_covariance = (
+                context.local_covariance
+                + other_context.local_covariance
+                + 2.0 * pose_covariance
+                + time_sync_covariance
+            )
+            pairwise_support = _gaussian_kernel_zero_mean_diag(
+                pairwise_residuals,
+                support_covariance,
+            ).reshape(active_offsets.size, other_context.candidate_states.shape[0])
+            target_support = pairwise_support * other_likelihoods[target_idx].reshape(1, -1)
+            best_support = np.max(target_support, axis=1)
+            cooperative_support[covered_by_other] += best_support[covered_by_other]
+
+        raw_prior = uniqueness * cooperative_support
+        if normalize_target_mean:
+            positive_mean = float(np.mean(raw_prior[raw_prior > 0.0])) if np.any(raw_prior > 0.0) else 1.0
+            raw_prior = raw_prior / max(positive_mean, 1.0e-12)
+        candidate_prior = np.clip(raw_prior, min_prior_value, max_prior_value)
+        if adaptive_pruning_enabled:
+            innovation_covariance_diagonal = (
+                np.diag(context.predicted_covariances[target_idx])
+                + context.local_covariance
+                + pose_covariance
+            )
+            residual_positions = (
+                context.candidate_states[active_offsets, :pruning_dims]
+                - context.predicted_means[target_idx][:pruning_dims].reshape(1, pruning_dims)
+            )
+            position_mahalanobis_sq = np.sum(
+                np.square(residual_positions)
+                / innovation_covariance_diagonal[:pruning_dims].reshape(1, pruning_dims),
+                axis=1,
+            )
+            chi_square_mask = position_mahalanobis_sq <= pruning_chi_square
+            mass_mask = np.zeros(candidate_prior.shape, dtype=bool)
+            if np.any(chi_square_mask):
+                mass_mask[chi_square_mask] = _prior_mass_pruning_mask(
+                    candidate_prior[chi_square_mask],
+                    mass_ratio=pruning_mass_ratio,
+                )
+            candidate_prior = np.where(chi_square_mask & mass_mask, candidate_prior, 0.0)
+        reweighted[target_idx, active_offsets] *= candidate_prior
+
+    return reweighted
+
+
 def _build_bp_jpda_tracks_from_marginals(
     *,
     context: _BPJPDAAgentContext,
     marginals: np.ndarray,
     confidence_threshold: float,
+    max_missed_steps: int = 5,
 ) -> tuple[MultiTargetTrackOutput, dict[int, BPJPDAFilterState]]:
     agent_tracks: list[KeyTrackPosterior] = []
     agent_next_states: dict[int, BPJPDAFilterState] = {}
@@ -1894,11 +2141,19 @@ def _build_bp_jpda_tracks_from_marginals(
                 innovation_distance=float(best_innovation_distance),
             )
         )
-        agent_next_states[target_idx] = BPJPDAFilterState(
-            mean=posterior_state.astype(float, copy=True),
-            covariance=posterior_covariance.astype(float, copy=True),
-            motion_state=posterior_motion_state,
+        has_measurement_support = bool(context.track_active[target_idx] and np.any(full_weights > 0.0))
+        missed_count = _next_missed_count(
+            int(context.previous_missed_counts[target_idx]),
+            has_measurement_support=has_measurement_support,
+            max_missed_steps=max_missed_steps,
         )
+        if has_measurement_support or missed_count < _sanitize_max_missed_steps(max_missed_steps):
+            agent_next_states[target_idx] = BPJPDAFilterState(
+                mean=posterior_state.astype(float, copy=True),
+                covariance=posterior_covariance.astype(float, copy=True),
+                motion_state=posterior_motion_state,
+                missed_count=missed_count,
+            )
 
     return (
         MultiTargetTrackOutput(
@@ -1930,6 +2185,7 @@ def bp_jpda_association_for_friendlies(
     max_iterations: int = 20,
     convergence_tol: float = 1.0e-3,
     min_missed_detection_probability: float = 0.05,
+    max_missed_steps: int = 5,
     survival_probability: float = 0.98,
     birth_weight: float = 0.25,
     process_position_std_m: np.ndarray | Sequence[float] = (2.0, 2.0, 1.0),
@@ -1970,19 +2226,29 @@ def bp_jpda_association_for_friendlies(
             friendly_array[friendly_idx],
             global_target_priors,
         )
+        prior_valid_mask = _global_prior_valid_mask(global_target_priors, length=prior_relative_states.shape[0])
         local_relative_states, local_mask, local_covariance = _validate_local_observation(local_observations[str(agent_id)])
         valid_indices = np.flatnonzero(local_mask > 0.0)
 
         predicted_means: list[np.ndarray] = []
         predicted_covariances: list[np.ndarray] = []
         predicted_motion_states: list[IMMMotionState] = []
+        previous_missed_counts: list[int] = []
         track_active = np.ones(prior_relative_states.shape[0], dtype=bool)
         agent_previous_states = previous_states.get(str(agent_id), {})
         for target_idx in range(prior_relative_states.shape[0]):
+            previous_track_state = agent_previous_states.get(target_idx)
+            if _is_filter_state_expired(previous_track_state, max_missed_steps):
+                previous_track_state = None
+            prior_available = bool(prior_valid_mask[target_idx])
+            if not prior_available and previous_track_state is None:
+                track_active[target_idx] = False
+            previous_missed_counts.append(_previous_missed_count(previous_track_state))
             predicted_mean, predicted_covariance, predicted_motion_state = _bp_jpda_predict_track_state(
-                previous_filter_state=agent_previous_states.get(target_idx),
+                previous_filter_state=previous_track_state,
                 prior_relative_state=prior_relative_states[target_idx],
                 prior_covariance_diagonal=prior_covariance,
+                prior_available=prior_available,
                 recursive_motion_model=recursive_motion_model,
                 imm_model_types=imm_model_types,
                 imm_model_transition_matrix=imm_model_transition_matrix,
@@ -1998,6 +2264,8 @@ def bp_jpda_association_for_friendlies(
             predicted_means.append(predicted_mean)
             predicted_covariances.append(predicted_covariance)
             predicted_motion_states.append(predicted_motion_state)
+            if not prior_available:
+                prior_relative_states[target_idx] = predicted_mean
             innovation_covariance_diagonal = np.diag(predicted_covariance) + local_covariance
             prior_position_distance = float(np.linalg.norm(predicted_mean[:3]))
             if prior_position_distance > float(detection_radius_m) + _position_gate_margin(
@@ -2106,11 +2374,19 @@ def bp_jpda_association_for_friendlies(
                     innovation_distance=float(best_innovation_distance),
                 )
             )
-            agent_next_states[target_idx] = BPJPDAFilterState(
-                mean=posterior_state.astype(float, copy=True),
-                covariance=posterior_covariance.astype(float, copy=True),
-                motion_state=posterior_motion_state,
+            has_measurement_support = bool(track_active[target_idx] and np.any(full_weights > 0.0))
+            missed_count = _next_missed_count(
+                int(previous_missed_counts[target_idx]),
+                has_measurement_support=has_measurement_support,
+                max_missed_steps=max_missed_steps,
             )
+            if has_measurement_support or missed_count < _sanitize_max_missed_steps(max_missed_steps):
+                agent_next_states[target_idx] = BPJPDAFilterState(
+                    mean=posterior_state.astype(float, copy=True),
+                    covariance=posterior_covariance.astype(float, copy=True),
+                    motion_state=posterior_motion_state,
+                    missed_count=missed_count,
+                )
 
         outputs[str(agent_id)] = MultiTargetTrackOutput(
             agent_id=str(agent_id),
@@ -2121,7 +2397,7 @@ def bp_jpda_association_for_friendlies(
     return outputs, next_filter_states
 
 
-def aa_bp_jpda_association_for_friendlies(
+def labeled_anchor_bp_jpda_association_for_friendlies(
     *,
     friendly_states: np.ndarray,
     global_target_priors: GlobalKeyTargetStatePrior,
@@ -2141,6 +2417,7 @@ def aa_bp_jpda_association_for_friendlies(
     max_iterations: int = 20,
     convergence_tol: float = 1.0e-3,
     min_missed_detection_probability: float = 0.05,
+    max_missed_steps: int = 5,
     survival_probability: float = 0.98,
     birth_weight: float = 0.25,
     process_position_std_m: np.ndarray | Sequence[float] = (2.0, 2.0, 1.0),
@@ -2148,18 +2425,8 @@ def aa_bp_jpda_association_for_friendlies(
     imm_turn_rate_radps: float = 0.35,
     imm_ct_process_noise_scale: float = 1.25,
     confidence_threshold: float = 0.1,
-    local_attention_temperature: float = 2.0,
-    cross_uav_position_scale_m: float = 8.0,
-    cross_uav_velocity_scale_mps: float = 3.0,
-    cross_uav_support_threshold: float = 0.35,
-    local_evidence_weight: float = 0.6,
-    velocity_evidence_weight: float = 0.25,
-    density_penalty_weight: float = 0.35,
-    consensus_evidence_weight: float = 0.9,
-    consensus_count_weight: float = 0.45,
-    max_log_evidence: float = 1.5,
 ) -> tuple[dict[str, MultiTargetTrackOutput], dict[str, dict[int, BPJPDAFilterState]]]:
-    """Run BP-JPDA with local pair attention and cross-UAV consensus likelihood reweighting."""
+    """Run BP-JPDA with fixed key-target labels anchored to the current global prior."""
 
     friendly_array = _as_state_batch(friendly_states, name="friendly_states")
     if friendly_array.shape[0] != len(agent_ids):
@@ -2178,115 +2445,57 @@ def aa_bp_jpda_association_for_friendlies(
     missed_detection_probability = max(1.0 - local_detection_probability, float(min_missed_detection_probability))
     confidence_threshold = float(np.clip(confidence_threshold, 0.0, 1.0))
 
-    contexts: list[_BPJPDAAgentContext] = []
-    for friendly_idx, agent_id in enumerate(agent_ids):
-        contexts.append(
-            _build_bp_jpda_context(
-                agent_id=str(agent_id),
-                friendly_state=friendly_array[friendly_idx],
-                global_target_priors=global_target_priors,
-                local_observation=local_observations[str(agent_id)],
-                previous_filter_state=previous_states.get(str(agent_id), {}),
-                detection_radius_m=detection_radius_m,
-                relative_velocity_limit_mps=relative_velocity_limit_mps,
-                local_detection_probability=local_detection_probability,
-                clutter_rate_per_second=clutter_rate_per_second,
-                recursive_motion_model=recursive_motion_model,
-                imm_model_types=imm_model_types,
-                imm_model_transition_matrix=imm_model_transition_matrix,
-                imm_initial_model_probabilities=imm_initial_model_probabilities,
-                dt_seconds=dt_seconds,
-                gate_sigma=gate_sigma,
-                missed_detection_probability=missed_detection_probability,
-                survival_probability=survival_probability,
-                birth_weight=birth_weight,
-                process_position_std=process_position_std,
-                process_velocity_std=process_velocity_std,
-                imm_turn_rate_radps=imm_turn_rate_radps,
-                imm_ct_process_noise_scale=imm_ct_process_noise_scale,
-            )
-        )
-
     outputs: dict[str, MultiTargetTrackOutput] = {}
     next_filter_states: dict[str, dict[int, BPJPDAFilterState]] = {}
-    for context in contexts:
-        enhanced_likelihoods = _enhance_likelihoods_with_aa_bp_jpda(
-            context=context,
-            all_contexts=contexts,
+    for friendly_idx, agent_id in enumerate(agent_ids):
+        context = _build_bp_jpda_context(
+            agent_id=str(agent_id),
+            friendly_state=friendly_array[friendly_idx],
+            global_target_priors=global_target_priors,
+            local_observation=local_observations[str(agent_id)],
+            previous_filter_state=previous_states.get(str(agent_id), {}),
+            detection_radius_m=detection_radius_m,
+            relative_velocity_limit_mps=relative_velocity_limit_mps,
+            local_detection_probability=local_detection_probability,
+            clutter_rate_per_second=clutter_rate_per_second,
+            recursive_motion_model=recursive_motion_model,
+            imm_model_types=imm_model_types,
+            imm_model_transition_matrix=imm_model_transition_matrix,
+            imm_initial_model_probabilities=imm_initial_model_probabilities,
+            dt_seconds=dt_seconds,
             gate_sigma=gate_sigma,
-            local_attention_temperature=local_attention_temperature,
-            cross_uav_position_scale_m=cross_uav_position_scale_m,
-            cross_uav_velocity_scale_mps=cross_uav_velocity_scale_mps,
-            cross_uav_support_threshold=cross_uav_support_threshold,
-            local_evidence_weight=local_evidence_weight,
-            velocity_evidence_weight=velocity_evidence_weight,
-            density_penalty_weight=density_penalty_weight,
-            consensus_evidence_weight=consensus_evidence_weight,
-            consensus_count_weight=consensus_count_weight,
-            max_log_evidence=max_log_evidence,
+            missed_detection_probability=missed_detection_probability,
+            survival_probability=survival_probability,
+            birth_weight=birth_weight,
+            process_position_std=process_position_std,
+            process_velocity_std=process_velocity_std,
+            imm_turn_rate_radps=imm_turn_rate_radps,
+            imm_ct_process_noise_scale=imm_ct_process_noise_scale,
+            max_missed_steps=max_missed_steps,
+            anchor_to_global_prior=True,
         )
-        marginals = _run_bp_jpda(
-            enhanced_likelihoods,
-            max_iterations=max_iterations,
-            convergence_tol=convergence_tol,
-        ) if context.valid_indices.size and context.prior_relative_states.shape[0] else np.zeros_like(enhanced_likelihoods)
+        marginals = (
+            _run_bp_jpda(
+                context.likelihood_ratios,
+                max_iterations=max_iterations,
+                convergence_tol=convergence_tol,
+            )
+            if context.valid_indices.size and context.prior_relative_states.shape[0]
+            else np.zeros_like(context.likelihood_ratios)
+        )
         track_output, agent_next_states = _build_bp_jpda_tracks_from_marginals(
             context=context,
             marginals=marginals,
             confidence_threshold=confidence_threshold,
+            max_missed_steps=max_missed_steps,
         )
-        outputs[context.agent_id] = track_output
-        next_filter_states[context.agent_id] = agent_next_states
+        outputs[str(agent_id)] = track_output
+        next_filter_states[str(agent_id)] = agent_next_states
 
     return outputs, next_filter_states
 
 
-def _sinkhorn_attention_marginals(
-    likelihood_ratios: np.ndarray,
-    *,
-    iterations: int,
-    temperature: float,
-    missed_dummy_score: float,
-) -> np.ndarray:
-    likelihoods = np.asarray(likelihood_ratios, dtype=float)
-    if likelihoods.ndim != 2:
-        raise ValueError(f"likelihood_ratios must be 2D, got {likelihoods.shape}.")
-    num_targets, num_measurements = likelihoods.shape
-    if num_targets == 0:
-        return np.zeros_like(likelihoods, dtype=float)
-
-    log_scores = np.full((num_targets + 1, num_measurements + 1), -40.0, dtype=float)
-    valid_mask = likelihoods > 0.0
-    log_scores[:num_targets, :num_measurements][valid_mask] = np.log(np.maximum(likelihoods[valid_mask], 1.0e-12))
-    log_scores[:num_targets, num_measurements] = float(missed_dummy_score)
-    if num_measurements > 0:
-        log_scores[num_targets, :num_measurements] = 0.0
-    log_scores[num_targets, num_measurements] = 0.0
-
-    row_marginals = np.concatenate(
-        [
-            np.ones(num_targets, dtype=float),
-            np.asarray([float(num_measurements)], dtype=float),
-        ]
-    )
-    column_marginals = np.concatenate(
-        [
-            np.ones(num_measurements, dtype=float),
-            np.asarray([float(num_targets)], dtype=float),
-        ]
-    )
-    transport = _run_sinkhorn(
-        log_scores,
-        row_marginals,
-        column_marginals,
-        iterations=iterations,
-        temperature=temperature,
-    )
-    marginals = transport[:num_targets, :num_measurements]
-    return np.where(valid_mask, marginals, 0.0)
-
-
-def sinkhorn_ajpda_association_for_friendlies(
+def prior_gated_bp_jpda_association_for_friendlies(
     *,
     friendly_states: np.ndarray,
     global_target_priors: GlobalKeyTargetStatePrior,
@@ -2303,10 +2512,10 @@ def sinkhorn_ajpda_association_for_friendlies(
     imm_initial_model_probabilities: np.ndarray | Sequence[float] | None = None,
     dt_seconds: float,
     gate_sigma: float = 3.0,
-    sinkhorn_iterations: int = 30,
-    sinkhorn_temperature: float = 1.0,
-    sinkhorn_missed_dummy_score: float = -0.5,
+    max_iterations: int = 20,
+    convergence_tol: float = 1.0e-3,
     min_missed_detection_probability: float = 0.05,
+    max_missed_steps: int = 5,
     survival_probability: float = 0.98,
     birth_weight: float = 0.25,
     process_position_std_m: np.ndarray | Sequence[float] = (2.0, 2.0, 1.0),
@@ -2314,22 +2523,32 @@ def sinkhorn_ajpda_association_for_friendlies(
     imm_turn_rate_radps: float = 0.35,
     imm_ct_process_noise_scale: float = 1.25,
     confidence_threshold: float = 0.1,
-    local_attention_temperature: float = 2.0,
-    cross_uav_position_scale_m: float = 8.0,
-    cross_uav_velocity_scale_mps: float = 3.0,
-    cross_uav_support_threshold: float = 0.35,
-    local_evidence_weight: float = 0.6,
-    velocity_evidence_weight: float = 0.25,
-    density_penalty_weight: float = 0.35,
-    consensus_evidence_weight: float = 0.9,
-    consensus_count_weight: float = 0.45,
-    max_log_evidence: float = 1.5,
+    pose_position_std_m: np.ndarray | Sequence[float] = (0.5, 0.5, 0.1),
+    pose_velocity_std_mps: np.ndarray | Sequence[float] = (0.0, 0.0, 0.0),
+    time_sync_position_std_m: np.ndarray | Sequence[float] = (0.0, 0.0, 0.0),
+    time_sync_velocity_std_mps: np.ndarray | Sequence[float] = (0.0, 0.0, 0.0),
+    previous_fused_anchor_states: np.ndarray | None = None,
+    previous_fused_anchor_covariances: np.ndarray | None = None,
+    previous_fused_anchor_valid_mask: np.ndarray | None = None,
+    prior_covariance_inflation: float = 1.0,
+    clutter_likelihood: float = 0.05,
+    min_prior: float = 0.15,
+    max_prior: float = 4.0,
+    normalize_target_mean: bool = True,
+    adaptive_pruning_enabled: bool = False,
+    pruning_chi_square_confidence: float = 0.95,
+    pruning_mass_ratio: float = 0.90,
+    pruning_position_dimensions: int = 3,
 ) -> tuple[dict[str, MultiTargetTrackOutput], dict[str, dict[int, BPJPDAFilterState]]]:
-    """Approximate JPDA marginals with attention evidence and Sinkhorn assignment constraints."""
+    """Run BP-JPDA after training-free cooperative candidate-prior reweighting."""
 
     friendly_array = _as_state_batch(friendly_states, name="friendly_states")
     if friendly_array.shape[0] != len(agent_ids):
         raise ValueError("friendly_states row count must match agent_ids length.")
+    if max_iterations <= 0:
+        raise ValueError(f"max_iterations must be > 0, got {max_iterations}.")
+    if convergence_tol <= 0.0:
+        raise ValueError(f"convergence_tol must be > 0, got {convergence_tol}.")
     if gate_sigma <= 0.0:
         raise ValueError(f"gate_sigma must be > 0, got {gate_sigma}.")
 
@@ -2339,6 +2558,18 @@ def sinkhorn_ajpda_association_for_friendlies(
     local_detection_probability = float(np.clip(local_detection_probability, 0.0, 1.0))
     missed_detection_probability = max(1.0 - local_detection_probability, float(min_missed_detection_probability))
     confidence_threshold = float(np.clip(confidence_threshold, 0.0, 1.0))
+    pose_covariance_diagonal = np.concatenate(
+        [
+            np.square(np.asarray(pose_position_std_m, dtype=float).reshape(3)),
+            np.square(np.asarray(pose_velocity_std_mps, dtype=float).reshape(3)),
+        ]
+    )
+    time_sync_covariance_diagonal = np.concatenate(
+        [
+            np.square(np.asarray(time_sync_position_std_m, dtype=float).reshape(3)),
+            np.square(np.asarray(time_sync_velocity_std_mps, dtype=float).reshape(3)),
+        ]
+    )
 
     contexts: list[_BPJPDAAgentContext] = []
     for friendly_idx, agent_id in enumerate(agent_ids):
@@ -2366,37 +2597,55 @@ def sinkhorn_ajpda_association_for_friendlies(
                 process_velocity_std=process_velocity_std,
                 imm_turn_rate_radps=imm_turn_rate_radps,
                 imm_ct_process_noise_scale=imm_ct_process_noise_scale,
+                max_missed_steps=max_missed_steps,
             )
         )
+
+    local_likelihoods_by_agent = {
+        context.agent_id: _candidate_local_likelihoods_for_prior(
+            context,
+            pose_covariance_diagonal=pose_covariance_diagonal,
+            prior_covariance_inflation=prior_covariance_inflation,
+            fused_anchor_states=previous_fused_anchor_states,
+            fused_anchor_covariances=previous_fused_anchor_covariances,
+            fused_anchor_valid_mask=previous_fused_anchor_valid_mask,
+        )
+        for context in contexts
+    }
 
     outputs: dict[str, MultiTargetTrackOutput] = {}
     next_filter_states: dict[str, dict[int, BPJPDAFilterState]] = {}
     for context in contexts:
-        enhanced_likelihoods = _enhance_likelihoods_with_aa_bp_jpda(
+        reweighted_likelihoods = _cooperative_prior_reweighted_likelihoods(
             context=context,
             all_contexts=contexts,
-            gate_sigma=gate_sigma,
-            local_attention_temperature=local_attention_temperature,
-            cross_uav_position_scale_m=cross_uav_position_scale_m,
-            cross_uav_velocity_scale_mps=cross_uav_velocity_scale_mps,
-            cross_uav_support_threshold=cross_uav_support_threshold,
-            local_evidence_weight=local_evidence_weight,
-            velocity_evidence_weight=velocity_evidence_weight,
-            density_penalty_weight=density_penalty_weight,
-            consensus_evidence_weight=consensus_evidence_weight,
-            consensus_count_weight=consensus_count_weight,
-            max_log_evidence=max_log_evidence,
+            local_likelihoods_by_agent=local_likelihoods_by_agent,
+            detection_radius_m=detection_radius_m,
+            pose_covariance_diagonal=pose_covariance_diagonal,
+            time_sync_covariance_diagonal=time_sync_covariance_diagonal,
+            clutter_likelihood=clutter_likelihood,
+            min_prior=min_prior,
+            max_prior=max_prior,
+            normalize_target_mean=normalize_target_mean,
+            adaptive_pruning_enabled=adaptive_pruning_enabled,
+            pruning_chi_square_confidence=pruning_chi_square_confidence,
+            pruning_mass_ratio=pruning_mass_ratio,
+            pruning_position_dimensions=pruning_position_dimensions,
         )
-        marginals = _sinkhorn_attention_marginals(
-            enhanced_likelihoods,
-            iterations=sinkhorn_iterations,
-            temperature=sinkhorn_temperature,
-            missed_dummy_score=sinkhorn_missed_dummy_score,
-        ) if context.valid_indices.size and context.prior_relative_states.shape[0] else np.zeros_like(enhanced_likelihoods)
+        marginals = (
+            _run_bp_jpda(
+                reweighted_likelihoods,
+                max_iterations=max_iterations,
+                convergence_tol=convergence_tol,
+            )
+            if context.valid_indices.size and context.prior_relative_states.shape[0]
+            else np.zeros_like(reweighted_likelihoods)
+        )
         track_output, agent_next_states = _build_bp_jpda_tracks_from_marginals(
             context=context,
             marginals=marginals,
             confidence_threshold=confidence_threshold,
+            max_missed_steps=max_missed_steps,
         )
         outputs[context.agent_id] = track_output
         next_filter_states[context.agent_id] = agent_next_states
@@ -2430,6 +2679,7 @@ def lmb_association_for_friendlies(
     imm_turn_rate_radps: float = 0.35,
     imm_ct_process_noise_scale: float = 1.25,
     confidence_threshold: float = 0.1,
+    max_missed_steps: int = 5,
 ) -> tuple[dict[str, MultiTargetTrackOutput], dict[str, dict[int, LMBFilterState]]]:
     """Run a single-sensor LBP-LMB baseline for each friendly UAV."""
 
@@ -2462,6 +2712,7 @@ def lmb_association_for_friendlies(
             friendly_array[friendly_idx],
             global_target_priors,
         )
+        prior_valid_mask = _global_prior_valid_mask(global_target_priors, length=prior_relative_states.shape[0])
         local_relative_states, local_mask, local_covariance = _validate_local_observation(local_observations[str(agent_id)])
         valid_indices = np.flatnonzero(local_mask > 0.0)
 
@@ -2469,18 +2720,27 @@ def lmb_association_for_friendlies(
         predicted_covariances: list[np.ndarray] = []
         predicted_motion_states: list[IMMMotionState] = []
         predicted_existences: list[float] = []
+        previous_missed_counts: list[int] = []
         track_active = np.ones(prior_relative_states.shape[0], dtype=bool)
         agent_previous_states = previous_states.get(str(agent_id)) or {}
         for target_idx in range(prior_relative_states.shape[0]):
             previous_filter_state = agent_previous_states.get(target_idx)
+            if _is_filter_state_expired(previous_filter_state, max_missed_steps):
+                previous_filter_state = None
+            prior_available = bool(prior_valid_mask[target_idx])
+            if not prior_available and previous_filter_state is None:
+                track_active[target_idx] = False
+            previous_missed_counts.append(_previous_missed_count(previous_filter_state))
             predicted_mean, predicted_covariance, predicted_motion_state = _bp_jpda_predict_track_state(
                 previous_filter_state=None if previous_filter_state is None else BPJPDAFilterState(
                     mean=previous_filter_state.mean,
                     covariance=previous_filter_state.covariance,
                     motion_state=previous_filter_state.motion_state,
+                    missed_count=previous_filter_state.missed_count,
                 ),
                 prior_relative_state=prior_relative_states[target_idx],
                 prior_covariance_diagonal=prior_covariance,
+                prior_available=prior_available,
                 recursive_motion_model=recursive_motion_model,
                 imm_model_types=imm_model_types,
                 imm_model_transition_matrix=imm_model_transition_matrix,
@@ -2507,6 +2767,8 @@ def lmb_association_for_friendlies(
             predicted_means.append(predicted_mean)
             predicted_covariances.append(predicted_covariance)
             predicted_motion_states.append(predicted_motion_state)
+            if not prior_available:
+                prior_relative_states[target_idx] = predicted_mean
             predicted_existences.append(predicted_existence)
 
             innovation_covariance_diagonal = np.diag(predicted_covariance) + local_covariance
@@ -2632,12 +2894,20 @@ def lmb_association_for_friendlies(
                     innovation_distance=float(best_innovation_distance),
                 )
             )
-            agent_next_states[target_idx] = LMBFilterState(
-                existence_probability=posterior_existence,
-                mean=posterior_state.astype(float, copy=True),
-                covariance=posterior_covariance.astype(float, copy=True),
-                motion_state=posterior_motion_state,
+            has_measurement_support = bool(track_active[target_idx] and np.any(full_weights > 0.0))
+            missed_count = _next_missed_count(
+                int(previous_missed_counts[target_idx]),
+                has_measurement_support=has_measurement_support,
+                max_missed_steps=max_missed_steps,
             )
+            if has_measurement_support or missed_count < _sanitize_max_missed_steps(max_missed_steps):
+                agent_next_states[target_idx] = LMBFilterState(
+                    existence_probability=posterior_existence,
+                    mean=posterior_state.astype(float, copy=True),
+                    covariance=posterior_covariance.astype(float, copy=True),
+                    motion_state=posterior_motion_state,
+                    missed_count=missed_count,
+                )
 
         outputs[str(agent_id)] = MultiTargetTrackOutput(
             agent_id=str(agent_id),
@@ -2676,6 +2946,7 @@ def gm_phd_association_for_friendlies(
     imm_turn_rate_radps: float = 0.35,
     imm_ct_process_noise_scale: float = 1.25,
     confidence_threshold: float = 0.1,
+    max_missed_steps: int = 5,
 ) -> tuple[dict[str, MultiTargetTrackOutput], dict[str, GMPHDFilterState | None]]:
     """Run a standard local GM-PHD recursion and align extracted components to key priors."""
 
@@ -2712,9 +2983,13 @@ def gm_phd_association_for_friendlies(
         local_relative_states, local_mask, local_covariance = _validate_local_observation(local_observations[str(agent_id)])
         valid_indices = np.flatnonzero(local_mask > 0.0)
         candidate_states = local_relative_states[valid_indices] if valid_indices.size else np.zeros((0, STATE_DIM), dtype=float)
+        previous_filter_state = previous_states.get(str(agent_id))
+        if _is_filter_state_expired(previous_filter_state, max_missed_steps):
+            previous_filter_state = None
+        previous_missed_count = _previous_missed_count(previous_filter_state)
 
         predicted_components = _gm_phd_predict_components(
-            previous_filter_state=previous_states.get(str(agent_id)),
+            previous_filter_state=previous_filter_state,
             prior_relative_states=prior_relative_states,
             prior_covariance_diagonal=prior_covariance,
             recursive_motion_model=recursive_motion_model,
@@ -2799,12 +3074,9 @@ def gm_phd_association_for_friendlies(
             merge_mahalanobis_threshold=merge_mahalanobis_threshold,
             max_components=max_components,
         )
-        next_filter_states[str(agent_id)] = (
-            None if not filtered_components else GMPHDFilterState(components=filtered_components)
-        )
-
         if prior_relative_states.shape[0] == 0:
             outputs[str(agent_id)] = MultiTargetTrackOutput(agent_id=str(agent_id), tracks=tuple(), mode="local_only")
+            next_filter_states[str(agent_id)] = None
             continue
 
         if not filtered_components:
@@ -2813,6 +3085,16 @@ def gm_phd_association_for_friendlies(
                 prior_relative_states=prior_relative_states,
                 prior_covariance_diagonal=prior_covariance,
                 mode="local_only",
+            )
+            missed_count = _next_missed_count(
+                previous_missed_count,
+                has_measurement_support=False,
+                max_missed_steps=max_missed_steps,
+            )
+            next_filter_states[str(agent_id)] = (
+                None
+                if missed_count >= _sanitize_max_missed_steps(max_missed_steps)
+                else GMPHDFilterState(components=tuple(), missed_count=missed_count)
             )
             continue
 
@@ -2867,6 +3149,17 @@ def gm_phd_association_for_friendlies(
             agent_id=str(agent_id),
             tracks=tuple(tracks),
             mode="local_only",
+        )
+        has_measurement_support = any(track.valid for track in tracks)
+        missed_count = _next_missed_count(
+            previous_missed_count,
+            has_measurement_support=has_measurement_support,
+            max_missed_steps=max_missed_steps,
+        )
+        next_filter_states[str(agent_id)] = (
+            None
+            if missed_count >= _sanitize_max_missed_steps(max_missed_steps)
+            else GMPHDFilterState(components=filtered_components, missed_count=missed_count)
         )
 
     return outputs, next_filter_states

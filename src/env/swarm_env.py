@@ -15,14 +15,14 @@ from src.sensing.association import (
     LMBFilterState,
     MultiTargetTrackOutput,
     STATE_DIM,
-    aa_bp_jpda_association_for_friendlies,
     bp_jpda_association_for_friendlies,
     empty_multi_target_track_output,
     flatten_track_output,
     gm_phd_association_for_friendlies,
+    labeled_anchor_bp_jpda_association_for_friendlies,
     lmb_association_for_friendlies,
     nearest_local_candidate_association_for_friendlies,
-    sinkhorn_ajpda_association_for_friendlies,
+    prior_gated_bp_jpda_association_for_friendlies,
 )
 from src.sensing.delta_glmb import DeltaGLMBFilterState, delta_glmb_association_for_friendlies
 from src.sensing.global_sensor import (
@@ -62,7 +62,15 @@ from src.utils.config_loader import (
 )
 
 TRACKING_INPUT_MODES = {"local_only", "groundtruth"}
-ASSOCIATION_METHODS = {"none", "bp_jpda", "aa_bp_jpda", "sinkhorn_ajpda", "gm_phd", "lmb", "delta_glmb"}
+ASSOCIATION_METHODS = {
+    "none",
+    "bp_jpda",
+    "labeled_anchor_bp_jpda",
+    "prior_gated_bp_jpda",
+    "gm_phd",
+    "lmb",
+    "delta_glmb",
+}
 ASSIGNMENT_METHODS = {"placeholder", "hungarian"}
 
 
@@ -123,8 +131,8 @@ class SwarmEnv:
         self.association_method = get_tracking_association_method()
         if self.association_method not in ASSOCIATION_METHODS:
             raise ValueError(
-                "tracking.association_method must be one of 'none', 'bp_jpda', 'aa_bp_jpda', "
-                "'sinkhorn_ajpda', 'gm_phd', 'lmb', or 'delta_glmb', "
+                "tracking.association_method must be one of 'none', 'bp_jpda', "
+                "'labeled_anchor_bp_jpda', 'prior_gated_bp_jpda', 'gm_phd', 'lmb', or 'delta_glmb', "
                 f"got {self.association_method!r}."
             )
         self.assignment_method = get_tracking_assignment_method()
@@ -135,12 +143,53 @@ class SwarmEnv:
             )
 
         association_config = get_association_config()
+        self.nominal_detection_probability = float(association_config["nominal_detection_probability"])
+        self.nominal_clutter_rate_per_second = float(association_config["nominal_clutter_rate_per_second"])
         self.bp_jpda_gate_sigma = float(association_config["bp_jpda_gate_sigma"])
         self.bp_jpda_max_iterations = int(association_config["bp_jpda_max_iterations"])
         self.bp_jpda_convergence_tol = float(association_config["bp_jpda_convergence_tol"])
         self.bp_jpda_min_missed_detection_probability = float(
             association_config["bp_jpda_min_missed_detection_probability"]
         )
+        self.prior_gated_bp_jpda_pose_position_std_m = np.asarray(
+            association_config["prior_gated_bp_jpda_pose_position_std_m"], dtype=float
+        )
+        self.prior_gated_bp_jpda_pose_velocity_std_mps = np.asarray(
+            association_config["prior_gated_bp_jpda_pose_velocity_std_mps"], dtype=float
+        )
+        self.prior_gated_bp_jpda_time_sync_position_std_m = np.asarray(
+            association_config["prior_gated_bp_jpda_time_sync_position_std_m"], dtype=float
+        )
+        self.prior_gated_bp_jpda_time_sync_velocity_std_mps = np.asarray(
+            association_config["prior_gated_bp_jpda_time_sync_velocity_std_mps"], dtype=float
+        )
+        self.prior_gated_bp_jpda_use_previous_fused_anchor = bool(
+            association_config["prior_gated_bp_jpda_use_previous_fused_anchor"]
+        )
+        self.prior_gated_bp_jpda_prior_covariance_inflation = float(
+            association_config["prior_gated_bp_jpda_prior_covariance_inflation"]
+        )
+        self.prior_gated_bp_jpda_clutter_likelihood = float(
+            association_config["prior_gated_bp_jpda_clutter_likelihood"]
+        )
+        self.prior_gated_bp_jpda_min_prior = float(association_config["prior_gated_bp_jpda_min_prior"])
+        self.prior_gated_bp_jpda_max_prior = float(association_config["prior_gated_bp_jpda_max_prior"])
+        self.prior_gated_bp_jpda_normalize_target_mean = bool(
+            association_config["prior_gated_bp_jpda_normalize_target_mean"]
+        )
+        self.prior_gated_bp_jpda_adaptive_pruning_enabled = bool(
+            association_config["prior_gated_bp_jpda_adaptive_pruning_enabled"]
+        )
+        self.prior_gated_bp_jpda_pruning_chi_square_confidence = float(
+            association_config["prior_gated_bp_jpda_pruning_chi_square_confidence"]
+        )
+        self.prior_gated_bp_jpda_pruning_mass_ratio = float(
+            association_config["prior_gated_bp_jpda_pruning_mass_ratio"]
+        )
+        self.prior_gated_bp_jpda_pruning_position_dimensions = int(
+            association_config["prior_gated_bp_jpda_pruning_position_dimensions"]
+        )
+        self.association_track_max_missed_steps = int(association_config["association_track_max_missed_steps"])
         self.aa_bp_jpda_local_attention_temperature = float(
             association_config["aa_bp_jpda_local_attention_temperature"]
         )
@@ -161,9 +210,6 @@ class SwarmEnv:
         )
         self.aa_bp_jpda_consensus_count_weight = float(association_config["aa_bp_jpda_consensus_count_weight"])
         self.aa_bp_jpda_max_log_evidence = float(association_config["aa_bp_jpda_max_log_evidence"])
-        self.sinkhorn_ajpda_iterations = int(association_config["sinkhorn_ajpda_iterations"])
-        self.sinkhorn_ajpda_temperature = float(association_config["sinkhorn_ajpda_temperature"])
-        self.sinkhorn_ajpda_missed_dummy_score = float(association_config["sinkhorn_ajpda_missed_dummy_score"])
         self.recursive_motion_model = str(association_config["recursive_motion_model"]).lower()
         self.imm_model_types = tuple(str(model_type) for model_type in association_config["imm_model_types"])
         self.imm_model_transition_matrix = association_config["imm_model_transition_matrix"]
@@ -204,6 +250,10 @@ class SwarmEnv:
         global_sensor_config = GlobalKeyTargetSensingConfig(
             prior_position_std_m=np.asarray(sensing_config["prior_position_std_m"], dtype=float),
             prior_velocity_std_mps=np.asarray(sensing_config["prior_velocity_std_mps"], dtype=float),
+            prior_bias_position_std_m=np.asarray(sensing_config["prior_bias_position_std_m"], dtype=float),
+            prior_bias_velocity_std_mps=np.asarray(sensing_config["prior_bias_velocity_std_mps"], dtype=float),
+            prior_bias_correlation_steps=float(sensing_config["prior_bias_correlation_steps"]),
+            prior_missed_probability=float(sensing_config["prior_missed_probability"]),
         )
         self.global_key_target_sensor = GlobalKeyTargetStatePriorSensor(global_sensor_config, seed=self.seed)
 
@@ -211,11 +261,18 @@ class SwarmEnv:
         self.relative_velocity_limit_mps = float(self.enemy_vmax + self.friendly_vmax)
         local_sensor_config = LocalSensingConfig(
             detection_radius_m=float(local_sensing_config["detection_radius_m"]),
-            max_candidates=int(local_sensing_config["max_candidates"]),
             measurement_position_std_m=np.asarray(local_sensing_config["measurement_position_std_m"], dtype=float),
             measurement_velocity_std_mps=np.asarray(local_sensing_config["measurement_velocity_std_mps"], dtype=float),
             detection_probability=float(local_sensing_config["detection_probability"]),
+            detection_probability_min=float(local_sensing_config["detection_probability_min"]),
+            detection_full_probability_range_m=float(local_sensing_config["detection_full_probability_range_m"]),
+            detection_density_penalty_alpha=float(local_sensing_config["detection_density_penalty_alpha"]),
             clutter_rate_per_second=float(local_sensing_config["clutter_rate_per_second"]),
+            clutter_hotspot_probability=float(local_sensing_config["clutter_hotspot_probability"]),
+            clutter_hotspot_position_std_m=np.asarray(local_sensing_config["clutter_hotspot_position_std_m"], dtype=float),
+            clutter_hotspot_velocity_std_mps=np.asarray(
+                local_sensing_config["clutter_hotspot_velocity_std_mps"], dtype=float
+            ),
             dt_seconds=self.dt,
             relative_velocity_limit_mps=self.relative_velocity_limit_mps,
         )
@@ -376,6 +433,46 @@ class SwarmEnv:
             key_target_states=self.world.get_key_enemy_states(),
         )
 
+    def _previous_fused_anchor_arrays(
+        self,
+        *,
+        num_key_targets: int,
+    ) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
+        if self.world is None or self._last_fused_track_set is None or self._last_fused_time_step is None:
+            return None, None, None
+        if int(self._last_fused_time_step) >= int(self.world.time_step):
+            return None, None, None
+
+        states = np.zeros((int(num_key_targets), STATE_DIM), dtype=float)
+        covariances = np.zeros((int(num_key_targets), STATE_DIM, STATE_DIM), dtype=float)
+        valid_mask = np.zeros(int(num_key_targets), dtype=bool)
+        elapsed_steps = max(int(self.world.time_step) - int(self._last_fused_time_step), 1)
+        prediction_dt = float(elapsed_steps) * float(self.dt)
+        process_diagonal = np.concatenate(
+            [
+                np.square(self.gm_phd_process_position_std_m),
+                np.square(self.gm_phd_process_velocity_std_mps),
+            ]
+        ) * float(elapsed_steps)
+
+        for track in self._last_fused_track_set.tracks:
+            target_idx = int(track.global_target_index)
+            if target_idx < 0 or target_idx >= int(num_key_targets) or not bool(track.valid):
+                continue
+            state = np.asarray(track.fused_state_mean, dtype=float).reshape(STATE_DIM).copy()
+            state[:3] = state[:3] + state[3:6] * prediction_dt
+            covariance = np.asarray(track.fused_state_covariance, dtype=float)
+            if covariance.shape == (STATE_DIM,):
+                covariance = np.diag(covariance)
+            covariance = 0.5 * (covariance + covariance.T) + np.diag(process_diagonal)
+            states[target_idx] = state
+            covariances[target_idx] = covariance
+            valid_mask[target_idx] = True
+
+        if not np.any(valid_mask):
+            return None, None, None
+        return states, covariances, valid_mask
+
     def get_association_outputs(self) -> dict[str, MultiTargetTrackOutput]:
         """Return per-friendly multi-target local track posteriors for the current time step."""
 
@@ -434,8 +531,8 @@ class SwarmEnv:
                 previous_filter_states=self._bp_jpda_filter_states,
                 detection_radius_m=float(self.local_target_sensor.config.detection_radius_m),
                 relative_velocity_limit_mps=self.relative_velocity_limit_mps,
-                local_detection_probability=float(self.local_target_sensor.config.detection_probability),
-                clutter_rate_per_second=float(self.local_target_sensor.config.clutter_rate_per_second),
+                local_detection_probability=self.nominal_detection_probability,
+                clutter_rate_per_second=self.nominal_clutter_rate_per_second,
                 recursive_motion_model=self.recursive_motion_model,
                 imm_model_types=self.imm_model_types,
                 imm_model_transition_matrix=self.imm_model_transition_matrix,
@@ -445,6 +542,7 @@ class SwarmEnv:
                 max_iterations=self.bp_jpda_max_iterations,
                 convergence_tol=self.bp_jpda_convergence_tol,
                 min_missed_detection_probability=self.bp_jpda_min_missed_detection_probability,
+                max_missed_steps=self.association_track_max_missed_steps,
                 survival_probability=self.gm_phd_survival_probability,
                 birth_weight=self.gm_phd_birth_weight,
                 process_position_std_m=self.gm_phd_process_position_std_m,
@@ -458,8 +556,8 @@ class SwarmEnv:
             self._last_association_time_step = self.world.time_step
             return {agent_id: output for agent_id, output in outputs.items()}
 
-        if self.association_method == "aa_bp_jpda":
-            outputs, next_filter_states = aa_bp_jpda_association_for_friendlies(
+        if self.association_method == "labeled_anchor_bp_jpda":
+            outputs, next_filter_states = labeled_anchor_bp_jpda_association_for_friendlies(
                 friendly_states=friendly_states,
                 global_target_priors=global_key_priors,
                 local_observations=local_observations,
@@ -467,8 +565,8 @@ class SwarmEnv:
                 previous_filter_states=self._bp_jpda_filter_states,
                 detection_radius_m=float(self.local_target_sensor.config.detection_radius_m),
                 relative_velocity_limit_mps=self.relative_velocity_limit_mps,
-                local_detection_probability=float(self.local_target_sensor.config.detection_probability),
-                clutter_rate_per_second=float(self.local_target_sensor.config.clutter_rate_per_second),
+                local_detection_probability=self.nominal_detection_probability,
+                clutter_rate_per_second=self.nominal_clutter_rate_per_second,
                 recursive_motion_model=self.recursive_motion_model,
                 imm_model_types=self.imm_model_types,
                 imm_model_transition_matrix=self.imm_model_transition_matrix,
@@ -478,6 +576,7 @@ class SwarmEnv:
                 max_iterations=self.bp_jpda_max_iterations,
                 convergence_tol=self.bp_jpda_convergence_tol,
                 min_missed_detection_probability=self.bp_jpda_min_missed_detection_probability,
+                max_missed_steps=self.association_track_max_missed_steps,
                 survival_probability=self.gm_phd_survival_probability,
                 birth_weight=self.gm_phd_birth_weight,
                 process_position_std_m=self.gm_phd_process_position_std_m,
@@ -485,24 +584,23 @@ class SwarmEnv:
                 imm_turn_rate_radps=self.imm_turn_rate_radps,
                 imm_ct_process_noise_scale=self.imm_ct_process_noise_scale,
                 confidence_threshold=self.gm_phd_confidence_threshold,
-                local_attention_temperature=self.aa_bp_jpda_local_attention_temperature,
-                cross_uav_position_scale_m=self.aa_bp_jpda_cross_uav_position_scale_m,
-                cross_uav_velocity_scale_mps=self.aa_bp_jpda_cross_uav_velocity_scale_mps,
-                cross_uav_support_threshold=self.aa_bp_jpda_cross_uav_support_threshold,
-                local_evidence_weight=self.aa_bp_jpda_local_evidence_weight,
-                velocity_evidence_weight=self.aa_bp_jpda_velocity_evidence_weight,
-                density_penalty_weight=self.aa_bp_jpda_density_penalty_weight,
-                consensus_evidence_weight=self.aa_bp_jpda_consensus_evidence_weight,
-                consensus_count_weight=self.aa_bp_jpda_consensus_count_weight,
-                max_log_evidence=self.aa_bp_jpda_max_log_evidence,
             )
             self._bp_jpda_filter_states = next_filter_states
             self._last_association_outputs = outputs
             self._last_association_time_step = self.world.time_step
             return {agent_id: output for agent_id, output in outputs.items()}
 
-        if self.association_method == "sinkhorn_ajpda":
-            outputs, next_filter_states = sinkhorn_ajpda_association_for_friendlies(
+        if self.association_method == "prior_gated_bp_jpda":
+            previous_fused_anchor_states = None
+            previous_fused_anchor_covariances = None
+            previous_fused_anchor_valid_mask = None
+            if self.prior_gated_bp_jpda_use_previous_fused_anchor:
+                (
+                    previous_fused_anchor_states,
+                    previous_fused_anchor_covariances,
+                    previous_fused_anchor_valid_mask,
+                ) = self._previous_fused_anchor_arrays(num_key_targets=global_key_priors.states.shape[0])
+            outputs, next_filter_states = prior_gated_bp_jpda_association_for_friendlies(
                 friendly_states=friendly_states,
                 global_target_priors=global_key_priors,
                 local_observations=local_observations,
@@ -510,18 +608,18 @@ class SwarmEnv:
                 previous_filter_states=self._bp_jpda_filter_states,
                 detection_radius_m=float(self.local_target_sensor.config.detection_radius_m),
                 relative_velocity_limit_mps=self.relative_velocity_limit_mps,
-                local_detection_probability=float(self.local_target_sensor.config.detection_probability),
-                clutter_rate_per_second=float(self.local_target_sensor.config.clutter_rate_per_second),
+                local_detection_probability=self.nominal_detection_probability,
+                clutter_rate_per_second=self.nominal_clutter_rate_per_second,
                 recursive_motion_model=self.recursive_motion_model,
                 imm_model_types=self.imm_model_types,
                 imm_model_transition_matrix=self.imm_model_transition_matrix,
                 imm_initial_model_probabilities=self.imm_initial_model_probabilities,
                 dt_seconds=float(self.local_target_sensor.config.dt_seconds),
                 gate_sigma=self.bp_jpda_gate_sigma,
-                sinkhorn_iterations=self.sinkhorn_ajpda_iterations,
-                sinkhorn_temperature=self.sinkhorn_ajpda_temperature,
-                sinkhorn_missed_dummy_score=self.sinkhorn_ajpda_missed_dummy_score,
+                max_iterations=self.bp_jpda_max_iterations,
+                convergence_tol=self.bp_jpda_convergence_tol,
                 min_missed_detection_probability=self.bp_jpda_min_missed_detection_probability,
+                max_missed_steps=self.association_track_max_missed_steps,
                 survival_probability=self.gm_phd_survival_probability,
                 birth_weight=self.gm_phd_birth_weight,
                 process_position_std_m=self.gm_phd_process_position_std_m,
@@ -529,16 +627,22 @@ class SwarmEnv:
                 imm_turn_rate_radps=self.imm_turn_rate_radps,
                 imm_ct_process_noise_scale=self.imm_ct_process_noise_scale,
                 confidence_threshold=self.gm_phd_confidence_threshold,
-                local_attention_temperature=self.aa_bp_jpda_local_attention_temperature,
-                cross_uav_position_scale_m=self.aa_bp_jpda_cross_uav_position_scale_m,
-                cross_uav_velocity_scale_mps=self.aa_bp_jpda_cross_uav_velocity_scale_mps,
-                cross_uav_support_threshold=self.aa_bp_jpda_cross_uav_support_threshold,
-                local_evidence_weight=self.aa_bp_jpda_local_evidence_weight,
-                velocity_evidence_weight=self.aa_bp_jpda_velocity_evidence_weight,
-                density_penalty_weight=self.aa_bp_jpda_density_penalty_weight,
-                consensus_evidence_weight=self.aa_bp_jpda_consensus_evidence_weight,
-                consensus_count_weight=self.aa_bp_jpda_consensus_count_weight,
-                max_log_evidence=self.aa_bp_jpda_max_log_evidence,
+                pose_position_std_m=self.prior_gated_bp_jpda_pose_position_std_m,
+                pose_velocity_std_mps=self.prior_gated_bp_jpda_pose_velocity_std_mps,
+                time_sync_position_std_m=self.prior_gated_bp_jpda_time_sync_position_std_m,
+                time_sync_velocity_std_mps=self.prior_gated_bp_jpda_time_sync_velocity_std_mps,
+                previous_fused_anchor_states=previous_fused_anchor_states,
+                previous_fused_anchor_covariances=previous_fused_anchor_covariances,
+                previous_fused_anchor_valid_mask=previous_fused_anchor_valid_mask,
+                prior_covariance_inflation=self.prior_gated_bp_jpda_prior_covariance_inflation,
+                clutter_likelihood=self.prior_gated_bp_jpda_clutter_likelihood,
+                min_prior=self.prior_gated_bp_jpda_min_prior,
+                max_prior=self.prior_gated_bp_jpda_max_prior,
+                normalize_target_mean=self.prior_gated_bp_jpda_normalize_target_mean,
+                adaptive_pruning_enabled=self.prior_gated_bp_jpda_adaptive_pruning_enabled,
+                pruning_chi_square_confidence=self.prior_gated_bp_jpda_pruning_chi_square_confidence,
+                pruning_mass_ratio=self.prior_gated_bp_jpda_pruning_mass_ratio,
+                pruning_position_dimensions=self.prior_gated_bp_jpda_pruning_position_dimensions,
             )
             self._bp_jpda_filter_states = next_filter_states
             self._last_association_outputs = outputs
@@ -554,8 +658,8 @@ class SwarmEnv:
                 previous_filter_states=self._gm_phd_filter_states,
                 detection_radius_m=float(self.local_target_sensor.config.detection_radius_m),
                 relative_velocity_limit_mps=self.relative_velocity_limit_mps,
-                local_detection_probability=float(self.local_target_sensor.config.detection_probability),
-                clutter_rate_per_second=float(self.local_target_sensor.config.clutter_rate_per_second),
+                local_detection_probability=self.nominal_detection_probability,
+                clutter_rate_per_second=self.nominal_clutter_rate_per_second,
                 recursive_motion_model=self.recursive_motion_model,
                 imm_model_types=self.imm_model_types,
                 imm_model_transition_matrix=self.imm_model_transition_matrix,
@@ -572,6 +676,7 @@ class SwarmEnv:
                 imm_turn_rate_radps=self.imm_turn_rate_radps,
                 imm_ct_process_noise_scale=self.imm_ct_process_noise_scale,
                 confidence_threshold=self.gm_phd_confidence_threshold,
+                max_missed_steps=self.association_track_max_missed_steps,
             )
             self._gm_phd_filter_states = next_filter_states
             self._last_association_outputs = outputs
@@ -587,8 +692,8 @@ class SwarmEnv:
                 previous_filter_states=self._lmb_filter_states,
                 detection_radius_m=float(self.local_target_sensor.config.detection_radius_m),
                 relative_velocity_limit_mps=self.relative_velocity_limit_mps,
-                local_detection_probability=float(self.local_target_sensor.config.detection_probability),
-                clutter_rate_per_second=float(self.local_target_sensor.config.clutter_rate_per_second),
+                local_detection_probability=self.nominal_detection_probability,
+                clutter_rate_per_second=self.nominal_clutter_rate_per_second,
                 recursive_motion_model=self.recursive_motion_model,
                 imm_model_types=self.imm_model_types,
                 imm_model_transition_matrix=self.imm_model_transition_matrix,
@@ -604,6 +709,7 @@ class SwarmEnv:
                 imm_turn_rate_radps=self.imm_turn_rate_radps,
                 imm_ct_process_noise_scale=self.imm_ct_process_noise_scale,
                 confidence_threshold=self.gm_phd_confidence_threshold,
+                max_missed_steps=self.association_track_max_missed_steps,
             )
             self._lmb_filter_states = next_filter_states
             self._last_association_outputs = outputs
@@ -619,8 +725,8 @@ class SwarmEnv:
                 previous_filter_states=self._delta_glmb_filter_states,
                 detection_radius_m=float(self.local_target_sensor.config.detection_radius_m),
                 relative_velocity_limit_mps=self.relative_velocity_limit_mps,
-                local_detection_probability=float(self.local_target_sensor.config.detection_probability),
-                clutter_rate_per_second=float(self.local_target_sensor.config.clutter_rate_per_second),
+                local_detection_probability=self.nominal_detection_probability,
+                clutter_rate_per_second=self.nominal_clutter_rate_per_second,
                 recursive_motion_model=self.recursive_motion_model,
                 imm_model_types=self.imm_model_types,
                 imm_model_transition_matrix=self.imm_model_transition_matrix,
@@ -636,6 +742,7 @@ class SwarmEnv:
                 confidence_threshold=self.gm_phd_confidence_threshold,
                 max_hypotheses=self.delta_glmb_max_hypotheses,
                 hypothesis_weight_prune_threshold=self.delta_glmb_hypothesis_weight_prune_threshold,
+                max_missed_steps=self.association_track_max_missed_steps,
             )
             self._delta_glmb_filter_states = next_filter_states
             self._last_association_outputs = outputs

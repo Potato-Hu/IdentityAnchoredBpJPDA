@@ -32,8 +32,8 @@ def _association_method_suffix(association_method: str) -> str:
     suffix_by_method = {
         "none": "none",
         "bp_jpda": "bpjpda",
-        "aa_bp_jpda": "aabpjpda",
-        "sinkhorn_ajpda": "sinkhornajpda",
+        "labeled_anchor_bp_jpda": "labeledanchorbpjpda",
+        "prior_gated_bp_jpda": "priorgatedbpjpda",
         "gm_phd": "gmphd",
         "lmb": "lmb",
         "delta_glmb": "dglmb",

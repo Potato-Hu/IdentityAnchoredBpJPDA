@@ -4,23 +4,23 @@ entity_counts:
   # Number of key enemy targets generated in each scene by default.
   key_targets: 3
   # Number of non-key enemy targets generated in each scene by default.
-  nonkey_targets: 6
+  nonkey_targets: 8
 
 initialization:
   # Distance range in meters used when sampling non-key enemies near key targets.
-  nonkey_enemy_nearby_distance_m: [2.0, 8.0]
+  nonkey_enemy_nearby_distance_m: [2.0, 5.0]
   # Distance range in meters used when sampling friendly UAVs around the key-target cluster.
   # The current sampler keeps friendlies near the shared key-target center, so increasing this
   # range spreads them out more while still preserving overlapping fields of view.
-  friendly_uav_nearby_distance_m: [5.0, 10.0]
+  friendly_uav_nearby_distance_m: [10.0, 15.0]
   # Minimum separation in meters enforced between sampled friendly UAV initial positions.
-  friendly_uav_min_separation_m: 10.0
+  friendly_uav_min_separation_m: 15.0
 
 enemy_mobility:
   # Enemy motion model used to update target trajectories each simulation step.
   model: gauss_markov
   # Size of the 3D map in meters: [x_max, y_max, z_max].
-  bounds: [70.0, 70.0, 20.0]
+  bounds: [100.0, 100.0, 20.0]
   # Minimum distance kept from the map boundary when clipping positions.
   # This avoids agents being updated exactly onto the edge of the valid region.
   safety_margin: 1.0
@@ -65,22 +65,39 @@ global_sensing:
   prior_position_std_m: [5.0, 5.0, 1.0]
   # Velocity std in meters per second for [vx, vy, vz].
   prior_velocity_std_mps: [1.0, 1.0, 0.2]
+  # Low-frequency sensor-frame bias drift standard deviation. This adds a small
+  # common bias to every key-target prior for about 6 steps on average.
+  prior_bias_position_std_m: [2, 2, 0.4]
+  prior_bias_velocity_std_mps: [0.25, 0.25, 0.05]
+  prior_bias_correlation_steps: 6.0
+  # Per-key independent probability that the external global prior is absent at
+  # one simulation step. Missing priors keep target labels stable via a valid mask.
+  prior_missed_probability: 0.00
 
 local_sensing:
   # Omnidirectional detection radius in meters for each friendly UAV.
   detection_radius_m: 50.0
-  # Fixed number of local target candidates returned per friendly UAV.
-  # Friendly UAVs are not included in these candidate slots.
-  max_candidates: 10
+  # Friendly UAVs are not included in local target candidates.
   # Standard MTT notation: this block defines the diagonal entries of the local
   # measurement covariance R for z = [dx, dy, dz, dvx, dvy, dvz].
   # Position-measurement std in meters for relative [dx, dy, dz].
   measurement_position_std_m: [2.0, 2.0, 0.4]
   # Velocity-measurement std in meters per second for relative [dvx, dvy, dvz].
   measurement_velocity_std_mps: [1.0, 1.0, 0.2]
-  # Probability that an in-range real target generates a local measurement at one step.
-  detection_probability: 0.95
-  # Average number of clutter / false-alarm measurements generated per second inside
-  # one UAV's local measurement space. The code converts this to a per-step Poisson
-  # mean by multiplying with simulation.dt.
-  clutter_rate_per_second: 1.0
+  # State-dependent detection profile parameters.
+  # - detection_probability_near: near-range detection probability
+  # - detection_probability_min: lower bound after range / crowding degradation
+  # - detection_full_probability_range_m: keep full probability inside this range
+  # - detection_density_penalty_alpha: crowding penalty strength
+  detection_probability_near: 0.95
+  detection_probability_min: 0.50
+  detection_full_probability_range_m: 20.0
+  detection_density_penalty_alpha: 0.5
+  # Background false-alarm rate lambda_bg in the local sensing space. This remains
+  # low because most ambiguity is already created by non-key targets.
+  clutter_rate_per_second: 0.6
+  # Make false alarms spatially local: when clutter is generated, most of it is
+  # sampled near visible targets instead of uniformly over the whole sensing volume.
+  clutter_hotspot_probability: 0.65
+  clutter_hotspot_position_std_m: [4.0, 4.0, 1.0]
+  clutter_hotspot_velocity_std_mps: [1.2, 1.2, 0.3]

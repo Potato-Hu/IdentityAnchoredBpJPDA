@@ -1,0 +1,17 @@
+extends: scenerios_base
+
+global_sensing:
+  # 50% larger high-frequency global-prior noise than base.
+  prior_position_std_m: [7.5, 7.5, 1.5]
+  prior_velocity_std_mps: [1.5, 1.5, 0.3]
+  # Stronger low-frequency shared bias for high-noise stress tests.
+  prior_bias_position_std_m: [5.0, 5.0, 1.0]
+  prior_bias_velocity_std_mps: [0.375, 0.375, 0.075]
+  prior_missed_probability: 0.10
+
+local_sensing:
+  # 50% larger local measurement noise than base.
+  measurement_position_std_m: [3.0, 3.0, 0.6]
+  measurement_velocity_std_mps: [1.5, 1.5, 0.3]
+  clutter_hotspot_position_std_m: [6.0, 6.0, 1.5]
+  clutter_hotspot_velocity_std_mps: [1.8, 1.8, 0.45]

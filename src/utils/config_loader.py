@@ -226,7 +226,20 @@ def get_initialization_config(path: str | Path | None = None) -> dict[str, Any]:
             raise ValueError(f"{name} must be a 2D vector [min_m, max_m], got shape {values.shape}.")
         return float(values[0]), float(values[1])
 
+    def _read_optional_vector3(raw_value: Any, *, name: str) -> np.ndarray | None:
+        if raw_value is None:
+            return None
+        return _read_vector3(raw_value, name=name, default=[0.0, 0.0, 0.0])
+
     return {
+        "key_enemy_initial_position_min_m": _read_optional_vector3(
+            initialization_config.get("key_enemy_initial_position_min_m"),
+            name="initialization.key_enemy_initial_position_min_m",
+        ),
+        "key_enemy_initial_position_max_m": _read_optional_vector3(
+            initialization_config.get("key_enemy_initial_position_max_m"),
+            name="initialization.key_enemy_initial_position_max_m",
+        ),
         "nonkey_enemy": _read_distance_pair(
             initialization_config.get("nonkey_enemy_nearby_distance_m"),
             name="initialization.nonkey_enemy_nearby_distance_m",
@@ -375,6 +388,18 @@ def get_global_sensing_config(path: str | Path | None = None) -> dict[str, Any]:
             name="global_sensing.prior_velocity_std_mps",
             default=[1.5, 1.5, 0.5],
         ),
+        "prior_bias_position_std_m": _read_vector3(
+            sensing_config.get("prior_bias_position_std_m"),
+            name="global_sensing.prior_bias_position_std_m",
+            default=[0.0, 0.0, 0.0],
+        ),
+        "prior_bias_velocity_std_mps": _read_vector3(
+            sensing_config.get("prior_bias_velocity_std_mps"),
+            name="global_sensing.prior_bias_velocity_std_mps",
+            default=[0.0, 0.0, 0.0],
+        ),
+        "prior_bias_correlation_steps": float(sensing_config.get("prior_bias_correlation_steps", 0.0)),
+        "prior_missed_probability": float(sensing_config.get("prior_missed_probability", 0.05)),
     }
 
 
@@ -388,7 +413,6 @@ def get_local_sensing_config(path: str | Path | None = None) -> dict[str, Any]:
 
     return {
         "detection_radius_m": float(sensing_config.get("detection_radius_m", 50.0)),
-        "max_candidates": int(sensing_config.get("max_candidates", 5)),
         "measurement_position_std_m": _read_vector3(
             sensing_config.get("measurement_position_std_m"),
             name="local_sensing.measurement_position_std_m",
@@ -399,8 +423,31 @@ def get_local_sensing_config(path: str | Path | None = None) -> dict[str, Any]:
             name="local_sensing.measurement_velocity_std_mps",
             default=[0.5, 0.5, 0.2],
         ),
-        "detection_probability": float(sensing_config.get("detection_probability", 0.95)),
+        "detection_probability": float(
+            sensing_config.get(
+                "detection_probability_near",
+                sensing_config.get("detection_probability", 0.95),
+            )
+        ),
+        "detection_probability_min": float(sensing_config.get("detection_probability_min", 0.6)),
+        "detection_full_probability_range_m": float(
+            sensing_config.get("detection_full_probability_range_m", 20.0)
+        ),
+        "detection_density_penalty_alpha": float(
+            sensing_config.get("detection_density_penalty_alpha", 0.25)
+        ),
         "clutter_rate_per_second": float(sensing_config.get("clutter_rate_per_second", 1.0)),
+        "clutter_hotspot_probability": float(sensing_config.get("clutter_hotspot_probability", 0.65)),
+        "clutter_hotspot_position_std_m": _read_vector3(
+            sensing_config.get("clutter_hotspot_position_std_m"),
+            name="local_sensing.clutter_hotspot_position_std_m",
+            default=[4.0, 4.0, 1.0],
+        ),
+        "clutter_hotspot_velocity_std_mps": _read_vector3(
+            sensing_config.get("clutter_hotspot_velocity_std_mps"),
+            name="local_sensing.clutter_hotspot_velocity_std_mps",
+            default=[1.2, 1.2, 0.3],
+        ),
     }
 
 
@@ -442,11 +489,64 @@ def get_association_config(path: str | Path | None = None) -> dict[str, Any]:
             )
 
     return {
+        "nominal_detection_probability": float(association_config.get("nominal_detection_probability", 0.80)),
+        "nominal_clutter_rate_per_second": float(
+            association_config.get("nominal_clutter_rate_per_second", 0.6)
+        ),
         "bp_jpda_gate_sigma": float(association_config.get("bp_jpda_gate_sigma", 3.0)),
         "bp_jpda_max_iterations": int(association_config.get("bp_jpda_max_iterations", 20)),
         "bp_jpda_convergence_tol": float(association_config.get("bp_jpda_convergence_tol", 1.0e-3)),
         "bp_jpda_min_missed_detection_probability": float(
             association_config.get("bp_jpda_min_missed_detection_probability", 0.05)
+        ),
+        "prior_gated_bp_jpda_pose_position_std_m": _read_vector3(
+            association_config.get("prior_gated_bp_jpda_pose_position_std_m"),
+            name="association.prior_gated_bp_jpda_pose_position_std_m",
+            default=[0.5, 0.5, 0.1],
+        ),
+        "prior_gated_bp_jpda_pose_velocity_std_mps": _read_vector3(
+            association_config.get("prior_gated_bp_jpda_pose_velocity_std_mps"),
+            name="association.prior_gated_bp_jpda_pose_velocity_std_mps",
+            default=[0.0, 0.0, 0.0],
+        ),
+        "prior_gated_bp_jpda_time_sync_position_std_m": _read_vector3(
+            association_config.get("prior_gated_bp_jpda_time_sync_position_std_m"),
+            name="association.prior_gated_bp_jpda_time_sync_position_std_m",
+            default=[0.0, 0.0, 0.0],
+        ),
+        "prior_gated_bp_jpda_time_sync_velocity_std_mps": _read_vector3(
+            association_config.get("prior_gated_bp_jpda_time_sync_velocity_std_mps"),
+            name="association.prior_gated_bp_jpda_time_sync_velocity_std_mps",
+            default=[0.0, 0.0, 0.0],
+        ),
+        "prior_gated_bp_jpda_use_previous_fused_anchor": bool(
+            association_config.get("prior_gated_bp_jpda_use_previous_fused_anchor", True)
+        ),
+        "prior_gated_bp_jpda_prior_covariance_inflation": float(
+            association_config.get("prior_gated_bp_jpda_prior_covariance_inflation", 1.0)
+        ),
+        "prior_gated_bp_jpda_clutter_likelihood": float(
+            association_config.get("prior_gated_bp_jpda_clutter_likelihood", 0.05)
+        ),
+        "prior_gated_bp_jpda_min_prior": float(association_config.get("prior_gated_bp_jpda_min_prior", 0.15)),
+        "prior_gated_bp_jpda_max_prior": float(association_config.get("prior_gated_bp_jpda_max_prior", 4.0)),
+        "prior_gated_bp_jpda_normalize_target_mean": bool(
+            association_config.get("prior_gated_bp_jpda_normalize_target_mean", True)
+        ),
+        "prior_gated_bp_jpda_adaptive_pruning_enabled": bool(
+            association_config.get("prior_gated_bp_jpda_adaptive_pruning_enabled", False)
+        ),
+        "prior_gated_bp_jpda_pruning_chi_square_confidence": float(
+            association_config.get("prior_gated_bp_jpda_pruning_chi_square_confidence", 0.95)
+        ),
+        "prior_gated_bp_jpda_pruning_mass_ratio": float(
+            association_config.get("prior_gated_bp_jpda_pruning_mass_ratio", 0.90)
+        ),
+        "prior_gated_bp_jpda_pruning_position_dimensions": int(
+            association_config.get("prior_gated_bp_jpda_pruning_position_dimensions", 3)
+        ),
+        "association_track_max_missed_steps": int(
+            association_config.get("association_track_max_missed_steps", 5)
         ),
         "aa_bp_jpda_local_attention_temperature": float(
             association_config.get("aa_bp_jpda_local_attention_temperature", 2.0)
@@ -474,11 +574,6 @@ def get_association_config(path: str | Path | None = None) -> dict[str, Any]:
             association_config.get("aa_bp_jpda_consensus_count_weight", 0.45)
         ),
         "aa_bp_jpda_max_log_evidence": float(association_config.get("aa_bp_jpda_max_log_evidence", 1.5)),
-        "sinkhorn_ajpda_iterations": int(association_config.get("sinkhorn_ajpda_iterations", 30)),
-        "sinkhorn_ajpda_temperature": float(association_config.get("sinkhorn_ajpda_temperature", 1.0)),
-        "sinkhorn_ajpda_missed_dummy_score": float(
-            association_config.get("sinkhorn_ajpda_missed_dummy_score", -0.5)
-        ),
         "recursive_motion_model": recursive_motion_model,
         "imm_model_types": imm_model_types,
         "imm_model_transition_matrix": imm_model_transition_matrix,

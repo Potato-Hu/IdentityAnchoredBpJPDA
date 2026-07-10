@@ -67,6 +67,38 @@ def _random_positions(count: int, bounds: np.ndarray, rng: np.random.Generator) 
     return rng.uniform(low=np.zeros(3, dtype=float), high=bounds, size=(count, 3))
 
 
+def _initial_sampling_bounds(scene_bounds: np.ndarray, initialization_config: Mapping[str, object]) -> tuple[np.ndarray, np.ndarray]:
+    lower = initialization_config.get("key_enemy_initial_position_min_m")
+    upper = initialization_config.get("key_enemy_initial_position_max_m")
+    if lower is None and upper is None:
+        return np.zeros(3, dtype=float), np.asarray(scene_bounds, dtype=float).reshape(3)
+    if lower is None or upper is None:
+        raise ValueError(
+            "initialization.key_enemy_initial_position_min_m and "
+            "initialization.key_enemy_initial_position_max_m must be configured together."
+        )
+    lower_bounds = np.asarray(lower, dtype=float).reshape(3)
+    upper_bounds = np.asarray(upper, dtype=float).reshape(3)
+    scene_bounds = np.asarray(scene_bounds, dtype=float).reshape(3)
+    if np.any(lower_bounds < 0.0) or np.any(upper_bounds > scene_bounds) or np.any(lower_bounds >= upper_bounds):
+        raise ValueError(
+            "key enemy initial position bounds must satisfy 0 <= min < max <= scene bounds, "
+            f"got min={lower_bounds.tolist()}, max={upper_bounds.tolist()}, scene_bounds={scene_bounds.tolist()}."
+        )
+    return lower_bounds, upper_bounds
+
+
+def _random_positions_in_box(
+    count: int,
+    lower_bounds: np.ndarray,
+    upper_bounds: np.ndarray,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    if count == 0:
+        return np.zeros((0, 3), dtype=float)
+    return rng.uniform(low=lower_bounds.reshape(1, 3), high=upper_bounds.reshape(1, 3), size=(count, 3))
+
+
 def _read_grid_splits(raw_value: object, *, default: Sequence[int] = (4, 4, 4)) -> np.ndarray:
     grid_splits = np.asarray(default if raw_value is None else raw_value, dtype=int)
     if grid_splits.ndim == 0:
@@ -382,6 +414,7 @@ def assign_initial_positions(
     manual_positions = dict(initial_positions or {})
     configured_distance_limits = dict(get_initialization_config())
     configured_distance_limits.update(dict(nearby_distance_limits or {}))
+    key_sampling_lower, key_sampling_upper = _initial_sampling_bounds(scene_bounds, configured_distance_limits)
     position_rng = rng if rng is not None else np.random.default_rng()
     nonkey_initialization_mode = str(
         configured_distance_limits.get("nonkey_initialization_mode", "near_key")
@@ -390,7 +423,7 @@ def assign_initial_positions(
     key_positions = (
         _validate_positions("key_enemy", manual_positions["key_enemy"], key_num, scene_bounds)
         if manual_positions.get("key_enemy") is not None
-        else _random_positions(key_num, scene_bounds, position_rng)
+        else _random_positions_in_box(key_num, key_sampling_lower, key_sampling_upper, position_rng)
     )
     if manual_positions.get("nonkey_enemy") is not None:
         nonkey_positions = _validate_positions("nonkey_enemy", manual_positions["nonkey_enemy"], nonkey_num, scene_bounds)
