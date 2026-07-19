@@ -378,6 +378,9 @@ def get_global_sensing_config(path: str | Path | None = None) -> dict[str, Any]:
         sensing_config = {}
 
     return {
+        "update_interval_seconds": float(sensing_config.get("update_interval_seconds", 1.0)),
+        "latency_mean_seconds": float(sensing_config.get("latency_mean_seconds", 0.5)),
+        "latency_std_seconds": float(sensing_config.get("latency_std_seconds", 0.25)),
         "prior_position_std_m": _read_vector3(
             sensing_config.get("prior_position_std_m"),
             name="global_sensing.prior_position_std_m",
@@ -489,7 +492,6 @@ def get_association_config(path: str | Path | None = None) -> dict[str, Any]:
             )
 
     return {
-        "nominal_detection_probability": float(association_config.get("nominal_detection_probability", 0.80)),
         "nominal_clutter_rate_per_second": float(
             association_config.get("nominal_clutter_rate_per_second", 0.6)
         ),
@@ -498,52 +500,6 @@ def get_association_config(path: str | Path | None = None) -> dict[str, Any]:
         "bp_jpda_convergence_tol": float(association_config.get("bp_jpda_convergence_tol", 1.0e-3)),
         "bp_jpda_min_missed_detection_probability": float(
             association_config.get("bp_jpda_min_missed_detection_probability", 0.05)
-        ),
-        "prior_gated_bp_jpda_pose_position_std_m": _read_vector3(
-            association_config.get("prior_gated_bp_jpda_pose_position_std_m"),
-            name="association.prior_gated_bp_jpda_pose_position_std_m",
-            default=[0.5, 0.5, 0.1],
-        ),
-        "prior_gated_bp_jpda_pose_velocity_std_mps": _read_vector3(
-            association_config.get("prior_gated_bp_jpda_pose_velocity_std_mps"),
-            name="association.prior_gated_bp_jpda_pose_velocity_std_mps",
-            default=[0.0, 0.0, 0.0],
-        ),
-        "prior_gated_bp_jpda_time_sync_position_std_m": _read_vector3(
-            association_config.get("prior_gated_bp_jpda_time_sync_position_std_m"),
-            name="association.prior_gated_bp_jpda_time_sync_position_std_m",
-            default=[0.0, 0.0, 0.0],
-        ),
-        "prior_gated_bp_jpda_time_sync_velocity_std_mps": _read_vector3(
-            association_config.get("prior_gated_bp_jpda_time_sync_velocity_std_mps"),
-            name="association.prior_gated_bp_jpda_time_sync_velocity_std_mps",
-            default=[0.0, 0.0, 0.0],
-        ),
-        "prior_gated_bp_jpda_use_previous_fused_anchor": bool(
-            association_config.get("prior_gated_bp_jpda_use_previous_fused_anchor", True)
-        ),
-        "prior_gated_bp_jpda_prior_covariance_inflation": float(
-            association_config.get("prior_gated_bp_jpda_prior_covariance_inflation", 1.0)
-        ),
-        "prior_gated_bp_jpda_clutter_likelihood": float(
-            association_config.get("prior_gated_bp_jpda_clutter_likelihood", 0.05)
-        ),
-        "prior_gated_bp_jpda_min_prior": float(association_config.get("prior_gated_bp_jpda_min_prior", 0.15)),
-        "prior_gated_bp_jpda_max_prior": float(association_config.get("prior_gated_bp_jpda_max_prior", 4.0)),
-        "prior_gated_bp_jpda_normalize_target_mean": bool(
-            association_config.get("prior_gated_bp_jpda_normalize_target_mean", True)
-        ),
-        "prior_gated_bp_jpda_adaptive_pruning_enabled": bool(
-            association_config.get("prior_gated_bp_jpda_adaptive_pruning_enabled", False)
-        ),
-        "prior_gated_bp_jpda_pruning_chi_square_confidence": float(
-            association_config.get("prior_gated_bp_jpda_pruning_chi_square_confidence", 0.95)
-        ),
-        "prior_gated_bp_jpda_pruning_mass_ratio": float(
-            association_config.get("prior_gated_bp_jpda_pruning_mass_ratio", 0.90)
-        ),
-        "prior_gated_bp_jpda_pruning_position_dimensions": int(
-            association_config.get("prior_gated_bp_jpda_pruning_position_dimensions", 3)
         ),
         "association_track_max_missed_steps": int(
             association_config.get("association_track_max_missed_steps", 5)
@@ -586,7 +542,6 @@ def get_association_config(path: str | Path | None = None) -> dict[str, Any]:
         "gm_phd_merge_mahalanobis": float(association_config.get("gm_phd_merge_mahalanobis", 2.0)),
         "gm_phd_max_components": int(association_config.get("gm_phd_max_components", 20)),
         "gm_phd_confidence_threshold": float(association_config.get("gm_phd_confidence_threshold", 0.1)),
-        "delta_glmb_max_hypotheses": int(association_config.get("delta_glmb_max_hypotheses", 48)),
         "delta_glmb_hypothesis_weight_prune_threshold": float(
             association_config.get("delta_glmb_hypothesis_weight_prune_threshold", 1.0e-4)
         ),

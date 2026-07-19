@@ -31,9 +31,11 @@ from src.visualization.plot_scene import (
 def _association_method_suffix(association_method: str) -> str:
     suffix_by_method = {
         "none": "none",
+        "prior_only": "prioronly",
         "bp_jpda": "bpjpda",
+        "hard_anchor_bp_jpda": "hardanchorbpjpda",
+        "covariance_anchor_bp_jpda": "covarianceanchorbpjpda",
         "labeled_anchor_bp_jpda": "labeledanchorbpjpda",
-        "prior_gated_bp_jpda": "priorgatedbpjpda",
         "gm_phd": "gmphd",
         "lmb": "lmb",
         "delta_glmb": "dglmb",
@@ -327,7 +329,8 @@ def export_tracking_rollout(
         f"final_ospa={float(tracking_summary['final_ospa']):.3f} m, "
         f"mean_gospa={float(tracking_summary['mean_gospa']):.3f} m, "
         f"final_gospa={float(tracking_summary['final_gospa']):.3f} m, "
-        f"mean_rmse={float(tracking_summary['mean_rmse']):.3f} m, "
+        f"valid_position_rmse={float(tracking_summary['position_rmse_valid']):.3f} m, "
+        f"coverage_penalized_rmse={float(tracking_summary['coverage_penalized_rmse']):.3f} m, "
         f"mean_coverage={100.0 * float(tracking_summary['mean_tracked_ratio']):.1f}%, "
         f"final_coverage={int(tracking_summary['final_tracked_count'])}/{key_truth_states.shape[1]}, "
         f"id_switches={int(tracking_summary['total_id_switches'])}, "

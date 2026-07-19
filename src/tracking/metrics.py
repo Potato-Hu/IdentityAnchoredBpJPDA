@@ -43,10 +43,10 @@ def compute_key_target_rmse(
     estimated_states: np.ndarray,
     valid_mask: np.ndarray,
 ) -> np.ndarray:
-    """Return per-step, per-target position RMSE in meters.
+    """Return per-step, per-target Euclidean position error in meters.
 
-    For a single rollout, the per-step RMSE reduces to the Euclidean position error
-    of each target estimate relative to truth.
+    Invalid estimates remain NaN; rollout summaries must report their coverage
+    separately or apply an explicit missed-track penalty.
     """
 
     truth_array = np.asarray(truth_states, dtype=float)
@@ -365,8 +365,25 @@ def summarize_key_target_tracking_episode(
     )
     tracked_counts, tracked_ratio = compute_key_target_tracking_coverage(valid_array)
 
-    finite_rmse = rmse[np.isfinite(rmse)]
-    mean_rmse = float(np.mean(finite_rmse)) if finite_rmse.size else np.nan
+    finite_position_errors = rmse[np.isfinite(rmse)]
+    mean_position_error_valid = (
+        float(np.mean(finite_position_errors)) if finite_position_errors.size else np.nan
+    )
+    position_rmse_valid = (
+        float(np.sqrt(np.mean(np.square(finite_position_errors))))
+        if finite_position_errors.size
+        else np.nan
+    )
+    penalized_position_errors = np.where(
+        valid_array & np.isfinite(rmse),
+        np.minimum(np.nan_to_num(rmse, nan=float(cutoff_distance)), float(cutoff_distance)),
+        float(cutoff_distance),
+    )
+    coverage_penalized_rmse = (
+        float(np.sqrt(np.mean(np.square(penalized_position_errors))))
+        if penalized_position_errors.size
+        else np.nan
+    )
     mean_ospa = float(np.mean(ospa)) if ospa.size else np.nan
     final_ospa = float(ospa[-1]) if ospa.size else np.nan
     mean_gospa = float(np.mean(gospa)) if gospa.size else np.nan
@@ -379,6 +396,8 @@ def summarize_key_target_tracking_episode(
 
     return {
         "rmse": rmse,
+        "position_error": rmse,
+        "penalized_position_error": penalized_position_errors,
         "ospa": ospa,
         "gospa": gospa,
         "tracked_counts": tracked_counts,
@@ -387,7 +406,12 @@ def summarize_key_target_tracking_episode(
         "id_switches_per_target": id_switches_per_target,
         "fragmentations_cumulative": fragmentations_cumulative,
         "fragmentations_per_target": fragmentations_per_target,
-        "mean_rmse": mean_rmse,
+        "mean_position_error_valid": mean_position_error_valid,
+        "position_rmse_valid": position_rmse_valid,
+        "coverage_penalized_rmse": coverage_penalized_rmse,
+        # Backward-compatible alias: unlike the old value, this includes a
+        # cutoff-distance penalty for every invalid target-time pair.
+        "mean_rmse": coverage_penalized_rmse,
         "mean_ospa": mean_ospa,
         "final_ospa": final_ospa,
         "mean_gospa": mean_gospa,
@@ -410,7 +434,7 @@ def export_key_target_metrics_csv(
     save_path: str | Path,
     inference_time_s: np.ndarray | None = None,
 ) -> Path:
-    """Export per-target RMSE, key-target OSPA, and common MOT diagnostics indexed by time step."""
+    """Export per-target position error, set metrics, and MOT diagnostics by time step."""
 
     truth_array = np.asarray(truth_states, dtype=float)
     estimate_array = np.asarray(estimated_states, dtype=float)
@@ -447,7 +471,7 @@ def export_key_target_metrics_csv(
     header = ["timestep", "time_s"]
     if inference_time_array is not None:
         header.append("tracking_inference_time_s")
-    header.extend(f"E{target_idx + 1}_rmse_m" for target_idx in range(num_targets))
+    header.extend(f"E{target_idx + 1}_position_error_m" for target_idx in range(num_targets))
     header.append("key_target_ospa_m")
     header.append("key_target_gospa_m")
     header.append("tracked_key_targets_count")

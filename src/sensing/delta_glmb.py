@@ -24,6 +24,7 @@ from src.sensing.association import (
     _position_gate_margin,
     _previous_missed_count,
     _sanitize_max_missed_steps,
+    _state_dependent_detection_probability,
     _update_motion_state_with_measurement,
     _validate_local_observation,
     empty_multi_target_track_output,
@@ -65,7 +66,6 @@ class _AssociationBranch:
 def _normalize_and_prune_hypotheses(
     hypotheses: Sequence[DeltaGLMBHypothesis],
     *,
-    max_hypotheses: int,
     weight_prune_threshold: float,
 ) -> tuple[DeltaGLMBHypothesis, ...]:
     if not hypotheses:
@@ -91,9 +91,6 @@ def _normalize_and_prune_hypotheses(
     ]
     if not pruned:
         pruned = [normalized[0]]
-    if int(max_hypotheses) > 0:
-        pruned = pruned[: int(max_hypotheses)]
-
     total_weight = float(sum(float(hypothesis.weight) for hypothesis in pruned))
     return tuple(
         DeltaGLMBHypothesis(
@@ -122,7 +119,6 @@ def _predict_hypotheses(
     process_velocity_std: np.ndarray,
     imm_turn_rate_radps: float,
     imm_ct_process_noise_scale: float,
-    max_hypotheses: int,
     max_missed_steps: int,
 ) -> tuple[DeltaGLMBHypothesis, ...]:
     base_hypotheses = previous_filter_state.hypotheses if previous_filter_state is not None else tuple()
@@ -137,7 +133,7 @@ def _predict_hypotheses(
         )
 
     predicted_hypotheses: list[DeltaGLMBHypothesis] = []
-    for hypothesis in base_hypotheses[: max(int(max_hypotheses), 1)]:
+    for hypothesis in base_hypotheses:
         predicted_track_states: list[DeltaGLMBTrackState] = []
         for target_idx in range(prior_relative_states.shape[0]):
             previous_track_state = hypothesis.track_states[target_idx] if target_idx < len(hypothesis.track_states) else None
@@ -200,7 +196,6 @@ def _predict_hypotheses(
         )
     return _normalize_and_prune_hypotheses(
         predicted_hypotheses,
-        max_hypotheses=max_hypotheses,
         weight_prune_threshold=0.0,
     )
 
@@ -212,6 +207,8 @@ def _build_target_branches(
     local_covariance: np.ndarray,
     detection_radius_m: float,
     local_detection_probability: float,
+    local_detection_probability_min: float,
+    detection_full_probability_range_m: float,
     clutter_intensity: float,
     gate_sigma: float,
     max_missed_steps: int,
@@ -221,6 +218,13 @@ def _build_target_branches(
     predicted_covariance_diagonal = np.diag(predicted_covariance)
     predicted_motion_state = predicted_track_state.motion_state
     predicted_existence = float(np.clip(predicted_track_state.existence_probability, 0.0, 1.0))
+    detection_probability = _state_dependent_detection_probability(
+        predicted_mean,
+        detection_radius_m=detection_radius_m,
+        probability_near=local_detection_probability,
+        probability_min=local_detection_probability_min,
+        full_probability_range_m=detection_full_probability_range_m,
+    )
 
     innovation_covariance_diagonal = predicted_covariance_diagonal + local_covariance
     prior_position_distance = float(np.linalg.norm(predicted_mean[:3]))
@@ -249,11 +253,11 @@ def _build_target_branches(
             )
         ]
 
-    missed_factor = (1.0 - predicted_existence) + predicted_existence * (1.0 - local_detection_probability)
+    missed_factor = (1.0 - predicted_existence) + predicted_existence * (1.0 - detection_probability)
     missed_factor = max(float(missed_factor), 1.0e-12)
     missed_existence = float(
         np.clip(
-            (predicted_existence * (1.0 - local_detection_probability)) / missed_factor,
+            (predicted_existence * (1.0 - detection_probability)) / missed_factor,
             0.0,
             1.0,
         )
@@ -296,7 +300,7 @@ def _build_target_branches(
     for gated_offset, gaussian_likelihood in zip(gated_offsets, gaussian_likelihoods):
         branch_weight = float(
             predicted_existence
-            * local_detection_probability
+            * detection_probability
             * float(gaussian_likelihood)
             / max(float(clutter_intensity), 1.0e-12)
         )
@@ -497,6 +501,8 @@ def delta_glmb_association_for_friendlies(
     detection_radius_m: float,
     relative_velocity_limit_mps: float,
     local_detection_probability: float,
+    local_detection_probability_min: float,
+    detection_full_probability_range_m: float,
     clutter_rate_per_second: float,
     recursive_motion_model: str = "imm",
     imm_model_types: Sequence[str] = ("cv", "ca", "ct_left", "ct_right"),
@@ -511,7 +517,6 @@ def delta_glmb_association_for_friendlies(
     imm_turn_rate_radps: float = 0.35,
     imm_ct_process_noise_scale: float = 1.25,
     confidence_threshold: float = 0.1,
-    max_hypotheses: int = 48,
     hypothesis_weight_prune_threshold: float = 1.0e-4,
     max_missed_steps: int = 5,
 ) -> tuple[dict[str, MultiTargetTrackOutput], dict[str, DeltaGLMBFilterState]]:
@@ -524,7 +529,6 @@ def delta_glmb_association_for_friendlies(
     previous_states = previous_filter_states or {}
     process_position_std = np.asarray(process_position_std_m, dtype=float).reshape(3)
     process_velocity_std = np.asarray(process_velocity_std_mps, dtype=float).reshape(3)
-    local_detection_probability = float(np.clip(local_detection_probability, 0.0, 1.0))
     confidence_threshold = float(np.clip(confidence_threshold, 0.0, 1.0))
     position_volume = (4.0 / 3.0) * np.pi * max(float(detection_radius_m), 1.0e-6) ** 3
     velocity_support = max(float(relative_velocity_limit_mps), 1.0e-6)
@@ -569,7 +573,6 @@ def delta_glmb_association_for_friendlies(
             process_velocity_std=process_velocity_std,
             imm_turn_rate_radps=imm_turn_rate_radps,
             imm_ct_process_noise_scale=imm_ct_process_noise_scale,
-            max_hypotheses=max_hypotheses,
             max_missed_steps=max_missed_steps,
         )
 
@@ -582,6 +585,8 @@ def delta_glmb_association_for_friendlies(
                     local_covariance=local_covariance,
                     detection_radius_m=detection_radius_m,
                     local_detection_probability=local_detection_probability,
+                    local_detection_probability_min=local_detection_probability_min,
+                    detection_full_probability_range_m=detection_full_probability_range_m,
                     clutter_intensity=clutter_intensity,
                     gate_sigma=gate_sigma,
                     max_missed_steps=max_missed_steps,
@@ -601,7 +606,6 @@ def delta_glmb_association_for_friendlies(
 
         normalized_hypotheses = _normalize_and_prune_hypotheses(
             updated_hypotheses,
-            max_hypotheses=max_hypotheses,
             weight_prune_threshold=hypothesis_weight_prune_threshold,
         )
         if not normalized_hypotheses:

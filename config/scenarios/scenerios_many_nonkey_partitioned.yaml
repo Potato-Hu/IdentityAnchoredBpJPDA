@@ -5,7 +5,7 @@ entity_counts:
   # friendly counts implicitly from the base scenario.
   friendly_uavs: 3
   key_targets: 3
-  nonkey_targets: 30
+  nonkey_targets: 15
 
 initialization:
   # Keep key targets away from the map edges so they are less likely to start near

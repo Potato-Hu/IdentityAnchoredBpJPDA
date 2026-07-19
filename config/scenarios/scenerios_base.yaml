@@ -59,20 +59,27 @@ enemy_mobility:
     pitch_jitter_std: 0.01
 
 global_sensing:
+  # The upstream surveillance source emits labeled target-designation reports at
+  # a lower rate than the 0.5 s local tracking loop.
+  update_interval_seconds: 1.0
+  # End-to-end sensing / processing latency is sampled from a Gaussian and
+  # truncated at zero before the report is delivered on a simulation step.
+  latency_mean_seconds: 0.5
+  latency_std_seconds: 0.25
   # Standard MTT notation: this block defines the diagonal entries of the weak
   # external key-target prior covariance P^- for x_prior = [x, y, z, vx, vy, vz].
   # Position std in meters for [x, y, z].
-  prior_position_std_m: [5.0, 5.0, 1.0]
+  prior_position_std_m: [5.0, 5.0, 2.0]
   # Velocity std in meters per second for [vx, vy, vz].
-  prior_velocity_std_mps: [1.0, 1.0, 0.2]
+  prior_velocity_std_mps: [1, 1, 0.4]
   # Low-frequency sensor-frame bias drift standard deviation. This adds a small
   # common bias to every key-target prior for about 6 steps on average.
-  prior_bias_position_std_m: [2, 2, 0.4]
-  prior_bias_velocity_std_mps: [0.25, 0.25, 0.05]
+  prior_bias_position_std_m: [4, 4, 0.8]
+  prior_bias_velocity_std_mps: [0.5, 0.5, 0.1]
   prior_bias_correlation_steps: 6.0
-  # Per-key independent probability that the external global prior is absent at
-  # one simulation step. Missing priors keep target labels stable via a valid mask.
-  prior_missed_probability: 0.00
+  # Per-key independent probability that one scheduled external report is absent.
+  # Missing reports keep target labels stable via a valid mask.
+  prior_missed_probability: 0.05
 
 local_sensing:
   # Omnidirectional detection radius in meters for each friendly UAV.
@@ -95,9 +102,9 @@ local_sensing:
   detection_density_penalty_alpha: 0.5
   # Background false-alarm rate lambda_bg in the local sensing space. This remains
   # low because most ambiguity is already created by non-key targets.
-  clutter_rate_per_second: 0.6
+  clutter_rate_per_second: 1
   # Make false alarms spatially local: when clutter is generated, most of it is
   # sampled near visible targets instead of uniformly over the whole sensing volume.
-  clutter_hotspot_probability: 0.65
+  clutter_hotspot_probability: 0.5
   clutter_hotspot_position_std_m: [4.0, 4.0, 1.0]
   clutter_hotspot_velocity_std_mps: [1.2, 1.2, 0.3]

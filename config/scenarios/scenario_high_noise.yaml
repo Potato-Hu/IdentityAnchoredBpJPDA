@@ -1,12 +1,19 @@
 extends: scenerios_base
+entity_counts:
+  # Configure this clutter-heavy scene directly instead of inheriting the key /
+  # friendly counts implicitly from the base scenario.
+  friendly_uavs: 3
+  key_targets: 3
+  nonkey_targets: 30
 
 global_sensing:
-  # 50% larger high-frequency global-prior noise than base.
-  prior_position_std_m: [7.5, 7.5, 1.5]
-  prior_velocity_std_mps: [1.5, 1.5, 0.3]
+  # Lower-rate and noisier target-designation reports than the base scenario.
+  update_interval_seconds: 2.0
+  prior_position_std_m: [10.0, 10.0, 4.0] # 2倍
+  prior_velocity_std_mps: [2.0, 2.0, 0.8] # 2倍
   # Stronger low-frequency shared bias for high-noise stress tests.
   prior_bias_position_std_m: [5.0, 5.0, 1.0]
-  prior_bias_velocity_std_mps: [0.375, 0.375, 0.075]
+  prior_bias_velocity_std_mps: [0.5, 0.5, 0.1]
   prior_missed_probability: 0.10
 
 local_sensing:
