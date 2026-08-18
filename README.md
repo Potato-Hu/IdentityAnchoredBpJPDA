@@ -1,48 +1,50 @@
 # SwarmJam
 
-SwarmJam 是一个面向多无人机协同场景的**关键目标优先多目标跟踪与数据关联研究平台**。项目在三维动态场景中模拟友方无人机、关键目标与非关键干扰目标，结合弱全局先验、局部匿名观测、多种关联算法和集中式航迹融合，评估关键目标的跟踪精度、覆盖率与身份连续性。
+English | [简体中文](README_CN.md)
 
-> 当前版本以多目标跟踪、数据关联和协同跟踪评估为主线，不包含可直接运行的强化学习训练入口。
+SwarmJam is a **key-target-prioritized multi-target tracking and data-association research platform** for cooperative multi-UAV scenarios. It simulates friendly UAVs, key targets, and non-key distractors in dynamic 3D environments, combining weak global priors, anonymous local observations, multiple association algorithms, and centralized track fusion to evaluate tracking accuracy, coverage, and identity continuity for key targets.
 
-## 主要内容
+> The current version focuses on multi-target tracking, data association, and cooperative tracking evaluation. It does not include a runnable reinforcement-learning training entry point.
 
-- **三维场景仿真**：支持关键/非关键目标、友方无人机、Gauss-Markov 与随机游走运动模型。
-- **多源感知建模**：生成带延迟、噪声和漏检的关键目标弱全局先验，以及带噪声、漏检和杂波的局部匿名观测。
-- **多目标数据关联**：实现最近邻、Surveillance-only、BP-JPDA、GM-PHD、LMB、δ-GLMB，以及多种先验锚定 BP-JPDA 方法。
-- **集中式航迹融合**：汇总各无人机的局部航迹，并通过一致性检查与协方差交叉融合得到全局关键目标航迹。
-- **协同跟踪闭环**：支持匈牙利任务分配和离散三维机动控制。
-- **评估与可视化**：输出 RMSE、OSPA、GOSPA、跟踪覆盖率、ID Switch、航迹碎片数、运行时间、轨迹图和 CSV/NPZ 数据。
+## Features
 
-系统流程：
+- **3D scenario simulation:** key and non-key targets, friendly UAVs, and Gauss-Markov or random-walk motion models.
+- **Multi-source sensing:** delayed, noisy, and occasionally missed global key-target priors, plus noisy local anonymous observations with missed detections and clutter.
+- **Multi-target data association:** nearest-neighbor, surveillance-only, BP-JPDA, GM-PHD, LMB, δ-GLMB, and several prior-anchored BP-JPDA variants.
+- **Centralized track fusion:** consistency checking and covariance-intersection fusion of local UAV tracks into global key-target tracks.
+- **Cooperative tracking loop:** Hungarian task assignment and discrete 3D motion control.
+- **Evaluation and visualization:** RMSE, OSPA, GOSPA, tracking coverage, ID switches, fragmentations, runtime, trajectory plots, and CSV/NPZ exports.
+
+System flow:
 
 ```text
-三维场景与目标运动
+3D scene and target motion
         │
-        ├── 弱全局关键目标先验
-        └── 各无人机局部匿名观测
-                    │
-                    ▼
-          局部数据关联与航迹维护
-                    │
-                    ▼
-            集中式航迹关联与融合
-                    │
-                    ▼
-          任务分配 → 无人机机动控制
-                    │
-                    ▼
-              指标统计与结果导出
+        ├── Weak global key-target priors
+        └── Anonymous observations from each UAV
+                        │
+                        ▼
+            Local association and tracking
+                        │
+                        ▼
+          Centralized association and fusion
+                        │
+                        ▼
+             Assignment → UAV control
+                        │
+                        ▼
+              Metrics and result export
 ```
 
-## 环境要求
+## Requirements
 
 - Python 3.10–3.12
-- Windows、Linux 或 macOS
-- 主要依赖：PyTorch、Gymnasium、NumPy、Matplotlib、Seaborn、PyYAML
+- Windows, Linux, or macOS
+- Main dependencies: PyTorch, Gymnasium, NumPy, Matplotlib, Seaborn, and PyYAML
 
-建议在项目根目录创建独立虚拟环境。
+Create an isolated virtual environment from the project root.
 
-Windows PowerShell：
+Windows PowerShell:
 
 ```powershell
 python -m venv .venv
@@ -51,7 +53,7 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
-Linux / macOS：
+Linux / macOS:
 
 ```bash
 python3 -m venv .venv
@@ -60,25 +62,25 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
-## 快速开始
+## Quick Start
 
-所有命令均在项目根目录执行。
+Run all commands from the project root.
 
-### 1. 检查场景生成与基础可视化
+### 1. Verify scene generation and basic visualization
 
 ```bash
 python main.py
 ```
 
-运行后会在 `outputs/figures/` 生成初始三维场景、敌方目标轨迹和友方无人机轨迹 PDF。
+This creates PDF figures for the initial 3D scene, enemy-target trajectories, and friendly-UAV trajectories under `outputs/figures/`.
 
-### 2. 运行一次完整跟踪实验
+### 2. Run one complete tracking experiment
 
 ```bash
 python -m src.runner.export_tracking_rollout --no-show
 ```
 
-默认参数来自 `config/default.yaml` 和 `config/env.yaml`。常用覆盖参数如下：
+Default values come from `config/default.yaml` and `config/env.yaml`. Common parameters can be overridden from the command line:
 
 ```bash
 python -m src.runner.export_tracking_rollout \
@@ -89,27 +91,27 @@ python -m src.runner.export_tracking_rollout \
   --no-show
 ```
 
-Windows PowerShell 也可以写成单行：
+The same command on one line, which is convenient in Windows PowerShell:
 
 ```powershell
 python -m src.runner.export_tracking_rollout --seed 10 --key-num 3 --nonkey-num 30 --mydrone-num 5 --no-show
 ```
 
-结果保存在：
+Results are saved to:
 
 ```text
-outputs/tracking_rollouts/<场景名>/<关联方法>/
+outputs/tracking_rollouts/<scenario>/<association_method>/
 ```
 
-其中包括轨迹 `NPZ`、位置与动作 `CSV`、关键目标指标 `CSV`，以及场景和轨迹 `PDF`。
+The directory contains trajectory data in NPZ format, position and action CSV files, a key-target metrics CSV, and scene and trajectory PDFs.
 
-### 3. 运行 Monte Carlo 方法对比
+### 3. Run a Monte Carlo method comparison
 
 ```bash
 python -m src.runner.run_tracking_monte_carlo --num-seeds 10 --start-seed 0
 ```
 
-默认比较 `bp_jpda`、`gm_phd`、`lmb`、`delta_glmb` 和 `labeled_anchor_bp_jpda`。也可以只指定部分方法：
+By default, this compares `bp_jpda`, `gm_phd`, `lmb`, `delta_glmb`, and `labeled_anchor_bp_jpda`. To compare only selected methods:
 
 ```bash
 python -m src.runner.run_tracking_monte_carlo \
@@ -117,21 +119,21 @@ python -m src.runner.run_tracking_monte_carlo \
   --methods bp_jpda labeled_anchor_bp_jpda
 ```
 
-`--num-seeds` 至少为 2。汇总 CSV 和带 95% 置信区间的对比图保存在：
+`--num-seeds` must be at least 2. Summary CSV files and comparison figures with 95% confidence intervals are saved to:
 
 ```text
-outputs/figure/<场景名>/method_comparison/
+outputs/figure/<scenario>/method_comparison/
 ```
 
-已有指标数据时，可只重新绘图：
+To regenerate figures from an existing metrics file without rerunning the simulations:
 
 ```bash
-python -m src.runner.run_tracking_monte_carlo --plot-only --csv-path <指标CSV路径>
+python -m src.runner.run_tracking_monte_carlo --plot-only --csv-path <metrics-csv-path>
 ```
 
-### 4. 非关键目标密度实验
+### 4. Run a non-key-target density sweep
 
-下面的命令比较不同非关键/关键目标数量比下的跟踪表现：
+The following command evaluates tracking performance at different non-key/key-target count ratios:
 
 ```bash
 python -m src.runner.run_nonkey_density_sweep \
@@ -140,35 +142,35 @@ python -m src.runner.run_nonkey_density_sweep \
   --ratios 3 5 10 15 20
 ```
 
-该实验固定使用 `labeled_anchor_bp_jpda`。总运行次数等于“种子数 × 比例数”，大规模参数会耗时较长。
+This experiment always uses `labeled_anchor_bp_jpda`. The total number of runs is the number of seeds multiplied by the number of ratios, so large experiments may take a while.
 
-## 配置说明
+## Configuration
 
-### 全局与环境配置
+### Global and environment configuration
 
-| 文件 | 作用 |
+| File | Purpose |
 | --- | --- |
-| `config/default.yaml` | 默认随机种子 |
-| `config/env.yaml` | 仿真步长、回合长度、跟踪模式、关联方法、任务分配、递推模型和融合参数 |
-| `config/scenarios/*.yaml` | 实体数量、初始化区域、地图范围、运动模型、感知噪声、漏检率和杂波参数 |
+| `config/default.yaml` | Default random seed |
+| `config/env.yaml` | Simulation step and duration, tracking mode, association method, assignment, recursive motion model, and fusion parameters |
+| `config/scenarios/*.yaml` | Entity counts, initialization regions, map bounds, motion, sensing noise, missed detections, and clutter |
 
-在 `config/env.yaml` 中切换场景：
+Select a scenario in `config/env.yaml`:
 
 ```yaml
 selected_scenario: scenerios_many_nonkey_partitioned
 ```
 
-仓库内置场景包括：
+Included scenarios:
 
-- `scenerios_base`：基础场景；
-- `scenerios_many_nonkey_partitioned`：大量非关键目标的分区运动场景；
-- `scenario_high_noise`：更强全局先验噪声场景。
+- `scenerios_base`: base scenario;
+- `scenerios_many_nonkey_partitioned`: partitioned motion with many non-key targets;
+- `scenario_high_noise`: stronger global-prior noise.
 
-场景名 `scenerios_*` 沿用当前文件名中的拼写，修改配置时请保持一致。
+The `scenerios_*` spelling is retained from the current filenames and must be used exactly as shown in the configuration.
 
-### 跟踪与关联方法
+### Tracking and association
 
-单次跟踪实验使用 `config/env.yaml` 中的配置：
+A single tracking rollout uses the following section of `config/env.yaml`:
 
 ```yaml
 tracking:
@@ -177,52 +179,52 @@ tracking:
   assignment: hungarian
 ```
 
-- `tracking.mode: local_only`：使用弱全局先验、局部匿名观测和关联算法，是默认研究模式。
-- `tracking.mode: groundtruth`：直接暴露关键目标真值航迹，仅用于调试或对照。
-- `tracking.assignment`：支持 `hungarian` 和 `placeholder`。
+- `tracking.mode: local_only` uses weak global priors, anonymous local observations, and an association algorithm. This is the default research mode.
+- `tracking.mode: groundtruth` exposes key-target ground-truth tracks directly and is intended only for debugging or reference comparisons.
+- `tracking.assignment` supports `hungarian` and `placeholder`.
 
-可用的 `association_method`：
+Available `association_method` values:
 
-| 方法 | 简要说明 |
+| Method | Description |
 | --- | --- |
-| `none` | 最近局部候选基线 |
-| `prior_only` | 仅使用外部关键目标先验与运动预测 |
-| `bp_jpda` | BP 优化的 JPDA 基线 |
-| `hard_anchor_bp_jpda` | 以当前带标签先验作为硬锚点 |
-| `covariance_anchor_bp_jpda` | 基于协方差融合的锚定 BP-JPDA |
-| `labeled_anchor_bp_jpda` | 固定关键目标标签的先验锚定 BP-JPDA（IA-BP-JPDA） |
-| `gm_phd` | GM-PHD 递推基线 |
-| `lmb` | Labeled Multi-Bernoulli 风格基线 |
-| `delta_glmb` | 紧凑 δ-GLMB 多假设基线 |
+| `none` | Nearest-local-candidate baseline |
+| `prior_only` | External key-target priors and motion prediction only |
+| `bp_jpda` | BP-optimized JPDA baseline |
+| `hard_anchor_bp_jpda` | Current labeled prior used as a hard anchor |
+| `covariance_anchor_bp_jpda` | Covariance-fused anchored BP-JPDA |
+| `labeled_anchor_bp_jpda` | Fixed key labels anchored to global priors (IA-BP-JPDA) |
+| `gm_phd` | GM-PHD recursive baseline |
+| `lmb` | Labeled Multi-Bernoulli-style baseline |
+| `delta_glmb` | Compact δ-GLMB multi-hypothesis baseline |
 
-关联与递推相关参数集中在 `config/env.yaml` 的 `association` 段；局部航迹融合参数位于 `track_fusion` 段。递推运动先验支持单一 `cv` 或由 `cv`、`ca`、`ct_left`、`ct_right` 组成的 `imm` 模型组。
+Association and recursive-estimation parameters are under `association` in `config/env.yaml`; local-track fusion parameters are under `track_fusion`. The recursive motion prior supports either a single `cv` model or an `imm` bank containing `cv`, `ca`, `ct_left`, and `ct_right`.
 
-## 项目结构
+## Project Structure
 
 ```text
 SwarmJam/
-├── config/                 # 全局、环境和场景配置
-├── docs/                   # 系统模型、问题定义与算法说明
-├── outputs/                # 仿真、指标和可视化结果
+├── config/                 # Global, environment, and scenario configuration
+├── docs/                   # System model, problem formulation, and algorithm notes
+├── outputs/                # Simulation data, metrics, and figures
 ├── src/
-│   ├── entities/           # 友方无人机与敌方目标实体
-│   ├── env/                # 环境封装与世界状态更新
-│   ├── interference/       # 信道与干扰功率计算
-│   ├── runner/             # 单次实验、Monte Carlo 与密度实验入口
-│   ├── sensing/            # 全局/局部感知与数据关联算法
-│   ├── simulation/         # 场景初始化、运动与轨迹生成
-│   ├── tracking/           # 航迹融合、指标、任务分配与控制
-│   ├── utils/              # 配置与随机种子工具
-│   └── visualization/      # 绘图与动画
-├── main.py                 # 场景生成与基础可视化入口
-└── requirements.txt        # Python 依赖
+│   ├── entities/           # Friendly-UAV and enemy-target entities
+│   ├── env/                # Environment wrapper and world-state updates
+│   ├── interference/       # Channel and interference calculations
+│   ├── runner/             # Single-run, Monte Carlo, and density-sweep entry points
+│   ├── sensing/            # Global/local sensing and association algorithms
+│   ├── simulation/         # Initialization, motion, and trajectory generation
+│   ├── tracking/           # Fusion, metrics, assignment, and control
+│   ├── utils/              # Configuration and random-seed utilities
+│   └── visualization/      # Plotting and animation
+├── main.py                 # Scene-generation and basic-visualization entry point
+└── requirements.txt        # Python dependencies
 ```
 
-## 进一步阅读
+## Further Reading
 
-- [系统模型](docs/system_model.md)
-- [问题定义](docs/problem_formulation.md)
-- [项目摘要](docs/project_summary.md)
-- [Labeled-anchor BP-JPDA 说明](docs/labeled_anchor_bp_jpda.md)
+- [System model](docs/system_model.md)
+- [Problem formulation](docs/problem_formulation.md)
+- [Project summary](docs/project_summary.md)
+- [Labeled-anchor BP-JPDA notes](docs/labeled_anchor_bp_jpda.md)
 
-本项目目前是研究原型。复现实验时建议固定随机种子，并同时记录场景、关联方法和完整配置。
+SwarmJam is currently a research prototype. For reproducible experiments, fix the random seed and record the selected scenario, association method, and complete configuration.
