@@ -23,7 +23,7 @@ _COLORS = {
     "key_entity": "#B42318",
     "key_trajectory": "#6D0F1B",
     "non_key_entity": "#6B7280",
-    "non_key_trajectory": "#6B7280",
+    "non_key_trajectory": "#8F939B",
     "friendly_entity": "#2F6BFF",
     "friendly_trajectory": "#1C9A96",
 }
@@ -34,15 +34,31 @@ _MARKERS = {
 }
 _MARKER_SIZES = {
     "snapshot": 42,
+    "non_key_snapshot": 40,
     "trajectory_end": 22,
-    "legend": 7,
+    "non_key_trajectory_end": 20,
+    "legend": 10,
+    "non_key_legend": 8,
 }
 _LINE_WIDTHS = {
-    "key": 1.35,
+    "key": 1.25,
     "non_key": 1.0,
     "friendly": 1.25,
 }
-_TEXT_SIZE = 7.5
+_TEXT_SIZE = 12
+_LABEL_OFFSET_MULTIPLIERS = np.array(
+    [
+        [1.0, 1.0, 1.0],
+        [1.0, -1.0, -1.0],
+        [-1.0, 1.0, 1.0],
+        [-1.0, -1.0, -1.0],
+        [2.0, 0.0, 1.0],
+        [-2.0, 0.0, -1.0],
+        [0.0, 2.0, 1.0],
+        [0.0, -2.0, -1.0],
+    ],
+    dtype=float,
+)
 
 
 def _style_3d_axes(ax, bounds: np.ndarray, view: tuple[float, float] = _VIEW) -> None:
@@ -55,14 +71,16 @@ def _style_3d_axes(ax, bounds: np.ndarray, view: tuple[float, float] = _VIEW) ->
     ax.set_xlim(0.0, float(bounds_array[0]))
     ax.set_ylim(0.0, float(bounds_array[1]))
     ax.set_zlim(0.0, float(bounds_array[2]))
+    ax.set_xticks(ax.get_xticks()[::2])
+    ax.set_yticks(ax.get_yticks()[::2])
     ax.set_box_aspect(tuple(bounds_array.tolist()))
     ax.view_init(elev=view[0], azim=view[1])
-    ax.tick_params(pad=2, labelsize=9)
+    ax.tick_params(pad=2, labelsize=12)
     ax.set_xlabel("X (m)")
     ax.set_ylabel("Y (m)")
     ax.set_zlabel("Z (m)")
 
-    ax.zaxis.set_major_locator(LinearLocator(numticks=5))
+    ax.zaxis.set_major_locator(LinearLocator(numticks=3))
     try:
         ax.set_proj_type("ortho")
     except Exception:
@@ -83,14 +101,21 @@ def _per_key_output_path(base_path: Path, key_label: str) -> Path:
     return base_path.with_name(f"{base_path.stem}_{key_label}{base_path.suffix}")
 
 
-def _build_legend() -> list[Line2D]:
-    return [
-        Line2D([0], [0], marker=_MARKERS["key"], color="w", markerfacecolor=_COLORS["key_entity"], markeredgecolor=_COLORS["key_entity"], markersize=_MARKER_SIZES["legend"], label="Key enemy UAV"),
-        Line2D([0], [0], marker=_MARKERS["non_key"], color="w", markerfacecolor=_COLORS["non_key_entity"], markeredgecolor=_COLORS["non_key_entity"], markersize=_MARKER_SIZES["legend"], label="Non-key enemy UAV"),
-        Line2D([0], [0], marker=_MARKERS["friendly"], color="w", markerfacecolor=_COLORS["friendly_entity"], markeredgecolor=_COLORS["friendly_entity"], markersize=_MARKER_SIZES["legend"], label="Friendly UAV"),
-        Line2D([0], [0], color=_COLORS["key_trajectory"], linewidth=_LINE_WIDTHS["key"], linestyle="-", label="Key enemy trajectory"),
-        Line2D([0], [0], color=_COLORS["non_key_trajectory"], linewidth=_LINE_WIDTHS["non_key"], linestyle="--", label="Non-key enemy trajectory"),
-        Line2D([0], [0], color=_COLORS["friendly_trajectory"], linewidth=_LINE_WIDTHS["friendly"], linestyle="-", label="Friendly trajectory"),
+def _build_legend(
+    *,
+    include_trajectories: bool = True,
+) -> list[Line2D]:
+    entity_handles = [
+        Line2D([0], [0], marker=_MARKERS["key"], color="w", markerfacecolor=_COLORS["key_entity"], markeredgecolor=_COLORS["key_entity"], markersize=_MARKER_SIZES["legend"], label="Key target"),
+        Line2D([0], [0], marker=_MARKERS["non_key"], color="w", markerfacecolor=_COLORS["non_key_entity"], markeredgecolor=_COLORS["non_key_entity"], markersize=_MARKER_SIZES["non_key_legend"], label="Non-key target"),
+        Line2D([0], [0], marker=_MARKERS["friendly"], color="w", markerfacecolor=_COLORS["friendly_entity"], markeredgecolor=_COLORS["friendly_entity"], markersize=_MARKER_SIZES["legend"], label="Defender UAV"),
+    ]
+    if not include_trajectories:
+        return entity_handles
+    return entity_handles + [
+        Line2D([0], [0], color=_COLORS["key_trajectory"], linewidth=_LINE_WIDTHS["key"], linestyle="-", label="Key target trajectory"),
+        Line2D([0], [0], color=_COLORS["non_key_trajectory"], linewidth=_LINE_WIDTHS["non_key"], linestyle="--", label="Non-key target trajectory"),
+        Line2D([0], [0], color=_COLORS["friendly_trajectory"], linewidth=_LINE_WIDTHS["friendly"], linestyle="-", label="Defender trajectory"),
     ]
 
 
@@ -99,8 +124,18 @@ def _label_offset(bounds: np.ndarray) -> np.ndarray:
     return np.maximum(bounds_array * np.array([0.012, 0.012, 0.02]), np.array([1.5, 1.5, 1.5]))
 
 
-def _annotate_entity(ax, coord: np.ndarray, label: str, color: str, bounds: np.ndarray) -> None:
+def _annotate_entity(
+    ax,
+    coord: np.ndarray,
+    label: str,
+    color: str,
+    bounds: np.ndarray,
+    *,
+    offset_slot: int | None = None,
+) -> None:
     offset = _label_offset(bounds)
+    if offset_slot is not None:
+        offset *= _LABEL_OFFSET_MULTIPLIERS[int(offset_slot) % len(_LABEL_OFFSET_MULTIPLIERS)]
     ax.text(
         coord[0] + offset[0],
         coord[1] + offset[1],
@@ -108,6 +143,8 @@ def _annotate_entity(ax, coord: np.ndarray, label: str, color: str, bounds: np.n
         label,
         color=color,
         fontsize=_TEXT_SIZE,
+        horizontalalignment="right" if offset[0] < 0.0 else "left",
+        verticalalignment="top" if offset[2] < 0.0 else "bottom",
         zorder=12,
     )
 
@@ -127,6 +164,8 @@ def plot_scene_snapshot(
     save_path: str | Path | None = None,
     title: str | None = None,
     show: bool = False,
+    include_trajectory_legend: bool = True,
+    legend_fontsize: float | None = None,
 ):
     max_step = trajectories.num_steps
     if timestep < 0 or timestep > max_step:
@@ -143,12 +182,14 @@ def plot_scene_snapshot(
         ax.scatter(coords[:, 0], coords[:, 1], coords[:, 2], c=_COLORS["key_entity"], marker=_MARKERS["key"], s=_MARKER_SIZES["snapshot"], depthshade=False)
     if non_key_indices:
         coords = trajectories.enemy_positions[timestep, non_key_indices]
-        ax.scatter(coords[:, 0], coords[:, 1], coords[:, 2], c=_COLORS["non_key_entity"], marker=_MARKERS["non_key"], s=_MARKER_SIZES["snapshot"], depthshade=False)
+        ax.scatter(coords[:, 0], coords[:, 1], coords[:, 2], c=_COLORS["non_key_entity"], marker=_MARKERS["non_key"], s=_MARKER_SIZES["non_key_snapshot"], depthshade=False)
 
     friendly_coords = trajectories.friendly_positions[timestep]
     ax.scatter(friendly_coords[:, 0], friendly_coords[:, 1], friendly_coords[:, 2], c=_COLORS["friendly_entity"], marker=_MARKERS["friendly"], s=_MARKER_SIZES["snapshot"], depthshade=False)
 
     for idx, node in enumerate(scene.enemy_nodes):
+        if node.role != "key":
+            continue
         coord = trajectories.enemy_positions[timestep, idx]
         _annotate_entity(ax, coord, f"E{idx + 1}", _enemy_entity_color(node.role), scene.bounds)
 
@@ -157,8 +198,17 @@ def plot_scene_snapshot(
         _annotate_entity(ax, coord, f"F{idx + 1}", _COLORS["friendly_entity"], scene.bounds)
 
     _style_3d_axes(ax, scene.bounds)
-    ax.legend(handles=_build_legend(), loc="upper left", frameon=False)
-    ax.set_title(title or f"Scene Snapshot at t = {timestep * trajectories.dt:.1f}s")
+    ax.legend(
+        handles=_build_legend(
+            include_trajectories=include_trajectory_legend,
+        ),
+        loc="upper left",
+        frameon=False,
+        fontsize=legend_fontsize,
+    )
+    resolved_title = f"Scene Snapshot at t = {timestep * trajectories.dt:.1f}s" if title is None else title
+    if resolved_title:
+        ax.set_title(resolved_title)
 
     output_path = _ensure_output_dir(save_path)
     if output_path is not None:
@@ -178,6 +228,7 @@ def plot_trajectories_until_timestep(
     save_path: str | Path | None = None,
     title: str | None = None,
     show: bool = False,
+    legend_fontsize: float | None = None,
 ):
     max_step = trajectories.num_steps
     if timestep < 0 or timestep > max_step:
@@ -186,6 +237,7 @@ def plot_trajectories_until_timestep(
     fig = plt.figure(figsize=(10, 7))
     ax = fig.add_subplot(111, projection="3d")
     end = timestep + 1
+    label_slot = 0
 
     if target in {"all", "enemy"}:
         for idx, node in enumerate(scene.enemy_nodes):
@@ -196,6 +248,11 @@ def plot_trajectories_until_timestep(
             linestyle = "-" if node.role == "key" else "--"
             alpha = 0.9 if node.role == "key" else 0.72
             linewidth = _LINE_WIDTHS["key"] if node.role == "key" else _LINE_WIDTHS["non_key"]
+            marker_size = (
+                _MARKER_SIZES["trajectory_end"]
+                if node.role == "key"
+                else _MARKER_SIZES["non_key_trajectory_end"]
+            )
             ax.plot(
                 coords[:, 0],
                 coords[:, 1],
@@ -205,8 +262,17 @@ def plot_trajectories_until_timestep(
                 linestyle=linestyle,
                 alpha=alpha,
             )
-            ax.scatter(coords[-1, 0], coords[-1, 1], coords[-1, 2], c=entity_color, marker=marker, s=_MARKER_SIZES["trajectory_end"], depthshade=False)
-            _annotate_entity(ax, coords[-1], f"E{idx + 1}", entity_color, scene.bounds)
+            ax.scatter(coords[-1, 0], coords[-1, 1], coords[-1, 2], c=entity_color, marker=marker, s=marker_size, depthshade=False)
+            if node.role == "key":
+                _annotate_entity(
+                    ax,
+                    coords[-1],
+                    f"E{idx + 1}",
+                    entity_color,
+                    scene.bounds,
+                    offset_slot=label_slot,
+                )
+                label_slot += 1
 
     if target in {"all", "friendly"}:
         for idx in range(len(scene.friendly_uavs)):
@@ -221,17 +287,32 @@ def plot_trajectories_until_timestep(
                 alpha=0.88,
             )
             ax.scatter(coords[-1, 0], coords[-1, 1], coords[-1, 2], c=_COLORS["friendly_entity"], marker=_MARKERS["friendly"], s=_MARKER_SIZES["trajectory_end"], depthshade=False)
-            _annotate_entity(ax, coords[-1], f"F{idx + 1}", _COLORS["friendly_entity"], scene.bounds)
+            _annotate_entity(
+                ax,
+                coords[-1],
+                f"F{idx + 1}",
+                _COLORS["friendly_entity"],
+                scene.bounds,
+                offset_slot=label_slot,
+            )
+            label_slot += 1
 
     _style_3d_axes(ax, scene.bounds)
-    ax.legend(handles=_build_legend(), loc="upper left", frameon=False)
+    ax.legend(
+        handles=_build_legend(),
+        loc="upper left",
+        frameon=False,
+        fontsize=legend_fontsize,
+    )
 
     default_titles = {
         "all": f"All UAV Trajectories up to t = {timestep * trajectories.dt:.1f}s",
         "enemy": f"Enemy Trajectories up to t = {timestep * trajectories.dt:.1f}s",
         "friendly": f"Friendly Trajectories up to t = {timestep * trajectories.dt:.1f}s",
     }
-    ax.set_title(title or default_titles[target])
+    resolved_title = default_titles[target] if title is None else title
+    if resolved_title:
+        ax.set_title(resolved_title)
 
     output_path = _ensure_output_dir(save_path)
     if output_path is not None:
@@ -249,6 +330,7 @@ def plot_tracking_rollout_trajectories(
     save_path: str | Path | None = None,
     title: str | None = None,
     show: bool = False,
+    legend_fontsize: float | None = None,
 ):
     return plot_trajectories_until_timestep(
         scene=scene,
@@ -256,8 +338,9 @@ def plot_tracking_rollout_trajectories(
         timestep=trajectories.num_steps,
         target="all",
         save_path=save_path,
-        title=title or "Tracking Rollout Enemy and Friendly Trajectories",
+        title=title if title is not None else "Tracking Rollout Enemy and Friendly Trajectories",
         show=show,
+        legend_fontsize=legend_fontsize,
     )
 
 
@@ -351,6 +434,7 @@ def plot_key_enemy_nearest_friendly_distance_curves(
     save_path: str | Path | None = None,
     title: str | None = None,
     show: bool = False,
+    legend_fontsize: float | None = None,
 ):
     """Plot all key-enemy nearest-friendly distance curves in one figure."""
 
@@ -393,7 +477,7 @@ def plot_key_enemy_nearest_friendly_distance_curves(
     ax.set_ylabel("Nearest friendly distance (m)")
     ax.grid(True, which="major", alpha=0.28, color="#94A3B8", linewidth=0.8)
     ax.grid(False, which="minor")
-    ax.legend(frameon=False)
+    ax.legend(frameon=False, fontsize=legend_fontsize)
     sns.despine(ax=ax, offset=4)
     fig.tight_layout()
 

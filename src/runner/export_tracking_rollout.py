@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import time
 from pathlib import Path
 
 import numpy as np
@@ -103,9 +102,8 @@ def _capture_key_target_tracking_state(
     state_dim = int(truth_states.shape[1]) if truth_states.ndim == 2 and truth_states.size > 0 else 6
     fused_state_means = np.full((num_key_targets, state_dim), np.nan, dtype=float)
     fused_valid_mask = np.zeros(num_key_targets, dtype=bool)
-    inference_start = time.perf_counter()
     fused_track_set = env.get_fused_track_set()
-    inference_time_s = time.perf_counter() - inference_start
+    inference_time_s = env.get_tracking_runtime_s()
     for track in fused_track_set.tracks:
         target_idx = int(track.global_target_index)
         if target_idx < 0 or target_idx >= num_key_targets or not bool(track.valid):
@@ -122,6 +120,7 @@ def rollout_tracking_episode(
     nonkey_num: int | None = None,
     mydrone_num: int | None = None,
     seed: int | None = None,
+    association_method: str | None = None,
 ) -> tuple[object, TrajectoryBundle, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     resolved_seed = get_default_seed() if seed is None else int(seed)
     resolved_key_num = get_num_key_targets() if key_num is None else int(key_num)
@@ -134,6 +133,7 @@ def rollout_tracking_episode(
         dt=get_simulation_dt(),
         max_steps=get_num_steps(),
         seed=resolved_seed,
+        association_method=association_method,
     )
     env.reset(seed=resolved_seed)
     if env.world is None or env.scene is None:
@@ -270,15 +270,18 @@ def export_tracking_rollout(
         trajectories=trajectories,
         timestep=0,
         save_path=snapshot_pdf,
-        title="Initial Scene for Tracking Rollout",
+        title="",
         show=show,
+        include_trajectory_legend=False,
+        legend_fontsize=12.0,
     )
     plot_tracking_rollout_trajectories(
         scene=scene,
         trajectories=trajectories,
         save_path=trajectory_pdf,
-        title="Tracking Rollout Enemy and Friendly Trajectories",
+        title="",
         show=show,
+        legend_fontsize=12.0,
     )
     export_position_timeseries_csv(
         scene=scene,
@@ -307,6 +310,7 @@ def export_tracking_rollout(
         trajectories=trajectories,
         save_path=key_distance_pdf,
         show=show,
+        legend_fontsize=12.0,
     )
 
     print(f"Saved trajectory data: {trajectory_npz}")

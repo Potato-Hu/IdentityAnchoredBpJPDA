@@ -2,23 +2,50 @@ extends: scenerios_base
 entity_counts:
   # Configure this clutter-heavy scene directly instead of inheriting the key /
   # friendly counts implicitly from the base scenario.
-  friendly_uavs: 3
+  friendly_uavs: 5
   key_targets: 3
   nonkey_targets: 30
 
+initialization:
+  # Keep key targets away from the map edges so they are less likely to start near
+  # the local sensor boundary. Non-key targets remain uniformly distributed below.
+  key_enemy_initial_position_min_m: [100.0, 100.0, 6.0]
+  key_enemy_initial_position_max_m: [120.0, 120.0, 10.0]
+  # Sample friendly UAVs independently inside this central box. When configured,
+  # these bounds take precedence over friendly_uav_nearby_distance_m.
+  friendly_uav_initial_position_min_m: [80.0, 80.0, 6.0]
+  friendly_uav_initial_position_max_m: [100.0, 100.0, 10.0]
+  # Spread non-key targets uniformly over the whole scene instead of spawning them
+  # around key targets.
+  nonkey_initialization_mode: uniform_random
+  # Restrict uniform non-key sampling to x/y in [50, 200] m while retaining the
+  # full map altitude range.
+  nonkey_enemy_initial_position_min_m: [0.0, 0.0, 0.0]
+  nonkey_enemy_initial_position_max_m: [200.0, 200.0, 20.0]
+
+enemy_mobility:
+  non_key_companion:
+    # Once non-key targets are globally dispersed, they should no longer inherit
+    # headings from nearby key targets.
+    enabled: true
+
+  non_key_local_partition:
+    # Constrain each non-key target to the 4 x 4 x 4 partition cell that contains
+    # its initial position, so each one moves only inside its own 1/64 local volume.
+    enabled: true
+    grid_splits: [2, 2, 2]
+
+    
 global_sensing:
   # Lower-rate and noisier target-designation reports than the base scenario.
-  update_interval_seconds: 2.0
-  prior_position_std_m: [10.0, 10.0, 4.0] # 2倍
-  prior_velocity_std_mps: [2.0, 2.0, 0.8] # 2倍
+  update_interval_seconds: 1.0 # 2倍于原来
+  prior_position_std_m: [20.0, 20.0, 4.0] # 2倍于原来
+  # Velocity std in meters per second for [vx, vy, vz].
+  prior_velocity_std_mps: [8, 8, 0.8] # 2倍于原来
   # Stronger low-frequency shared bias for high-noise stress tests.
-  prior_bias_position_std_m: [5.0, 5.0, 1.0]
-  prior_bias_velocity_std_mps: [0.5, 0.5, 0.1]
-  prior_missed_probability: 0.10
+  prior_missed_probability: 0.05
 
-local_sensing:
-  # 50% larger local measurement noise than base.
-  measurement_position_std_m: [3.0, 3.0, 0.6]
-  measurement_velocity_std_mps: [1.5, 1.5, 0.3]
-  clutter_hotspot_position_std_m: [6.0, 6.0, 1.5]
-  clutter_hotspot_velocity_std_mps: [1.8, 1.8, 0.45]
+# local_sensing:
+#   # 50% larger local measurement noise than base.
+#   measurement_position_std_m: [4.0, 4.0, 0.8]
+#   measurement_velocity_std_mps: [2, 2, 0.4]

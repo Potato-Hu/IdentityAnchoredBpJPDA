@@ -1,0 +1,3 @@
+method,num_runs,mean_gospa_m,mean_id_switches_per_run,mean_tracking_runtime_ms_per_step
+prior_only,100,27.926920298,15.090000000,17.486082556
+hard_anchor_bp_jpda,100,24.036299841,19.000000000,30.440793951

@@ -3,18 +3,26 @@ extends: scenerios_base
 entity_counts:
   # Configure this clutter-heavy scene directly instead of inheriting the key /
   # friendly counts implicitly from the base scenario.
-  friendly_uavs: 3
+  friendly_uavs: 5
   key_targets: 3
-  nonkey_targets: 15
+  nonkey_targets: 30
 
 initialization:
   # Keep key targets away from the map edges so they are less likely to start near
   # the local sensor boundary. Non-key targets remain uniformly distributed below.
-  key_enemy_initial_position_min_m: [25.0, 25.0, 6.0]
-  key_enemy_initial_position_max_m: [75.0, 75.0, 14.0]
+  key_enemy_initial_position_min_m: [100.0, 100.0, 6.0]
+  key_enemy_initial_position_max_m: [120.0, 120.0, 10.0]
+  # Sample friendly UAVs independently inside this central box. When configured,
+  # these bounds take precedence over friendly_uav_nearby_distance_m.
+  friendly_uav_initial_position_min_m: [80.0, 80.0, 6.0]
+  friendly_uav_initial_position_max_m: [100.0, 100.0, 10.0]
   # Spread non-key targets uniformly over the whole scene instead of spawning them
   # around key targets.
   nonkey_initialization_mode: uniform_random
+  # Restrict uniform non-key sampling to x/y in [50, 200] m while retaining the
+  # full map altitude range.
+  nonkey_enemy_initial_position_min_m: [0.0, 0.0, 0.0]
+  nonkey_enemy_initial_position_max_m: [200.0, 200.0, 20.0]
 
 enemy_mobility:
   non_key_companion:
@@ -26,4 +34,4 @@ enemy_mobility:
     # Constrain each non-key target to the 4 x 4 x 4 partition cell that contains
     # its initial position, so each one moves only inside its own 1/64 local volume.
     enabled: true
-    grid_splits: [4, 4, 4]
+    grid_splits: [2, 2, 2]

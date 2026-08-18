@@ -180,12 +180,13 @@ class LocalTargetSensor:
                         scale=noise_std,
                         size=detected_relative_states.shape,
                     )
-                velocity_limit = float(self.config.relative_velocity_limit_mps)
-                detected_relative_states[:, 3:] = np.clip(
-                    detected_relative_states[:, 3:],
-                    -velocity_limit,
-                    velocity_limit,
-                )
+                # Previous clipped-Gaussian implementation, kept for easy rollback:
+                # velocity_limit = float(self.config.relative_velocity_limit_mps)
+                # detected_relative_states[:, 3:] = np.clip(
+                #     detected_relative_states[:, 3:],
+                #     -velocity_limit,
+                #     velocity_limit,
+                # )
         else:
             visible_relative_states = np.zeros((0, STATE_DIM), dtype=float)
             density_scores = np.zeros(0, dtype=float)

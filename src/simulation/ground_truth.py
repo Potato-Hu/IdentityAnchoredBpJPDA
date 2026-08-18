@@ -88,6 +88,34 @@ def _initial_sampling_bounds(scene_bounds: np.ndarray, initialization_config: Ma
     return lower_bounds, upper_bounds
 
 
+def _optional_initial_sampling_bounds(
+    scene_bounds: np.ndarray,
+    initialization_config: Mapping[str, object],
+    *,
+    lower_config_key: str,
+    upper_config_key: str,
+    entity_name: str,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    lower = initialization_config.get(lower_config_key)
+    upper = initialization_config.get(upper_config_key)
+    if lower is None and upper is None:
+        return None
+    if lower is None or upper is None:
+        raise ValueError(
+            f"initialization.{lower_config_key} and "
+            f"initialization.{upper_config_key} must be configured together."
+        )
+    lower_bounds = np.asarray(lower, dtype=float).reshape(3)
+    upper_bounds = np.asarray(upper, dtype=float).reshape(3)
+    scene_bounds = np.asarray(scene_bounds, dtype=float).reshape(3)
+    if np.any(lower_bounds < 0.0) or np.any(upper_bounds > scene_bounds) or np.any(lower_bounds >= upper_bounds):
+        raise ValueError(
+            f"{entity_name} initial position bounds must satisfy 0 <= min < max <= scene bounds, "
+            f"got min={lower_bounds.tolist()}, max={upper_bounds.tolist()}, scene_bounds={scene_bounds.tolist()}."
+        )
+    return lower_bounds, upper_bounds
+
+
 def _random_positions_in_box(
     count: int,
     lower_bounds: np.ndarray,
@@ -228,16 +256,23 @@ def _sample_random_positions_with_min_separation(
     rng: np.random.Generator,
     *,
     min_separation: float,
+    lower_bounds: np.ndarray | None = None,
 ) -> np.ndarray:
+    sampling_lower = (
+        np.zeros(3, dtype=float)
+        if lower_bounds is None
+        else np.asarray(lower_bounds, dtype=float).reshape(3)
+    )
+    sampling_upper = np.asarray(bounds, dtype=float).reshape(3)
     if count == 0:
         return np.zeros((0, 3), dtype=float)
     if min_separation <= 0.0:
-        return _random_positions(count, bounds, rng)
+        return _random_positions_in_box(count, sampling_lower, sampling_upper, rng)
 
     positions: list[np.ndarray] = []
     for _ in range(count):
         for _ in range(4096):
-            candidate = rng.uniform(low=np.zeros(3, dtype=float), high=bounds, size=3)
+            candidate = rng.uniform(low=sampling_lower, high=sampling_upper, size=3)
             if not positions:
                 positions.append(candidate.astype(float))
                 break
@@ -248,7 +283,8 @@ def _sample_random_positions_with_min_separation(
         else:
             raise ValueError(
                 "Unable to sample friendly UAV initial positions with minimum separation "
-                f"{min_separation:.3f} inside bounds {bounds.tolist()}."
+                f"{min_separation:.3f} inside bounds "
+                f"[{sampling_lower.tolist()}, {sampling_upper.tolist()}]."
             )
     return np.asarray(positions, dtype=float)
 
@@ -415,6 +451,20 @@ def assign_initial_positions(
     configured_distance_limits = dict(get_initialization_config())
     configured_distance_limits.update(dict(nearby_distance_limits or {}))
     key_sampling_lower, key_sampling_upper = _initial_sampling_bounds(scene_bounds, configured_distance_limits)
+    friendly_sampling_bounds = _optional_initial_sampling_bounds(
+        scene_bounds,
+        configured_distance_limits,
+        lower_config_key="friendly_uav_initial_position_min_m",
+        upper_config_key="friendly_uav_initial_position_max_m",
+        entity_name="friendly UAV",
+    )
+    nonkey_sampling_bounds = _optional_initial_sampling_bounds(
+        scene_bounds,
+        configured_distance_limits,
+        lower_config_key="nonkey_enemy_initial_position_min_m",
+        upper_config_key="nonkey_enemy_initial_position_max_m",
+        entity_name="non-key enemy",
+    )
     position_rng = rng if rng is not None else np.random.default_rng()
     nonkey_initialization_mode = str(
         configured_distance_limits.get("nonkey_initialization_mode", "near_key")
@@ -429,7 +479,16 @@ def assign_initial_positions(
         nonkey_positions = _validate_positions("nonkey_enemy", manual_positions["nonkey_enemy"], nonkey_num, scene_bounds)
         nonkey_anchor_indices = _nearest_anchor_indices(nonkey_positions, key_positions)
     elif nonkey_initialization_mode == "uniform_random":
-        nonkey_positions = _random_positions(nonkey_num, scene_bounds, position_rng)
+        if nonkey_sampling_bounds is None:
+            nonkey_positions = _random_positions(nonkey_num, scene_bounds, position_rng)
+        else:
+            nonkey_sampling_lower, nonkey_sampling_upper = nonkey_sampling_bounds
+            nonkey_positions = _random_positions_in_box(
+                nonkey_num,
+                nonkey_sampling_lower,
+                nonkey_sampling_upper,
+                position_rng,
+            )
         nonkey_anchor_indices = _nearest_anchor_indices(nonkey_positions, key_positions)
     else:
         nonkey_positions, nonkey_anchor_indices = _sample_near_anchors_with_indices(
@@ -440,10 +499,24 @@ def assign_initial_positions(
             entity_name="nonkey_enemy",
             distance_limits=configured_distance_limits.get("nonkey_enemy"),
         )
-    friendly_positions = (
-        _validate_positions("friend_drone", manual_positions["friend_drone"], mydrone_num, scene_bounds)
-        if manual_positions.get("friend_drone") is not None
-        else _sample_overlapping_friendlies_near_keys(
+    if manual_positions.get("friend_drone") is not None:
+        friendly_positions = _validate_positions(
+            "friend_drone",
+            manual_positions["friend_drone"],
+            mydrone_num,
+            scene_bounds,
+        )
+    elif friendly_sampling_bounds is not None:
+        friendly_sampling_lower, friendly_sampling_upper = friendly_sampling_bounds
+        friendly_positions = _sample_random_positions_with_min_separation(
+            mydrone_num,
+            friendly_sampling_upper,
+            position_rng,
+            min_separation=float(configured_distance_limits.get("friend_drone_min_separation_m", 0.0)),
+            lower_bounds=friendly_sampling_lower,
+        )
+    else:
+        friendly_positions = _sample_overlapping_friendlies_near_keys(
             key_positions,
             mydrone_num,
             scene_bounds,
@@ -451,7 +524,6 @@ def assign_initial_positions(
             distance_limits=configured_distance_limits.get("friend_drone"),
             min_separation=float(configured_distance_limits.get("friend_drone_min_separation_m", 0.0)),
         )
-    )
 
     enemy_positions = np.vstack([key_positions, nonkey_positions])
     key_indices = np.arange(key_num, dtype=int)

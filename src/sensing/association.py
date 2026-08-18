@@ -107,6 +107,7 @@ class _BPJPDAAgentContext:
     predicted_covariances: tuple[np.ndarray, ...]
     predicted_motion_states: tuple[IMMMotionState, ...]
     track_active: np.ndarray
+    report_valid_mask: np.ndarray
     likelihood_ratios: np.ndarray
     previous_missed_counts: np.ndarray
 
@@ -1024,6 +1025,8 @@ def _state_dependent_detection_probability(
     probability_near: float,
     probability_min: float,
     full_probability_range_m: float,
+    density_score: float = 0.0,
+    density_penalty_alpha: float = 0.0,
 ) -> float:
     distance_m = float(np.linalg.norm(_as_state_vector(predicted_state, name="predicted_state")[:3]))
     detection_radius = max(float(detection_radius_m), 1.0e-6)
@@ -1033,14 +1036,134 @@ def _state_dependent_detection_probability(
     probability_min = float(np.clip(probability_min, 0.0, probability_near))
     full_probability_range = float(np.clip(full_probability_range_m, 0.0, detection_radius))
     if distance_m <= full_probability_range or full_probability_range >= detection_radius:
-        return probability_near
-    normalized_distance = (distance_m - full_probability_range) / max(
-        detection_radius - full_probability_range,
-        1.0e-6,
+        range_probability = probability_near
+    else:
+        normalized_distance = (distance_m - full_probability_range) / max(
+            detection_radius - full_probability_range,
+            1.0e-6,
+        )
+        range_probability = probability_near - (probability_near - probability_min) * float(
+            np.clip(normalized_distance, 0.0, 1.0)
+        )
+
+    # Previous range-only implementation, kept for easy rollback:
+    # return range_probability
+    density_penalty = np.exp(
+        -max(float(density_penalty_alpha), 0.0) * float(np.clip(density_score, 0.0, 1.0))
     )
-    return probability_near - (probability_near - probability_min) * float(
-        np.clip(normalized_distance, 0.0, 1.0)
+    return float(np.clip(range_probability * density_penalty, probability_min, probability_near))
+
+
+def _predicted_target_density_scores(
+    predicted_states: np.ndarray,
+    *,
+    detection_radius_m: float,
+    full_probability_range_m: float,
+) -> np.ndarray:
+    states = _as_state_batch(predicted_states, name="predicted_states")
+    if states.shape[0] == 0:
+        return np.zeros(0, dtype=float)
+    density_radius = max(
+        min(float(full_probability_range_m) * 0.5, float(detection_radius_m)),
+        1.0,
     )
+    position_deltas = states[:, None, :3] - states[None, :, :3]
+    distances = np.linalg.norm(position_deltas, axis=-1)
+    neighbor_counts = np.sum((distances <= density_radius) & (distances > 0.0), axis=1)
+    return np.clip(neighbor_counts.astype(float) / 4.0, 0.0, 1.0)
+
+
+def _bp_jpda_density_model_inputs(
+    predicted_means: Sequence[np.ndarray],
+    track_active: np.ndarray,
+    *,
+    detection_radius_m: float,
+    full_probability_range_m: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    target_count = len(predicted_means)
+    density_scores = np.zeros(target_count, dtype=float)
+    if target_count == 0:
+        return np.zeros((0, STATE_DIM), dtype=float), density_scores, np.zeros(0, dtype=int)
+
+    predicted_states = np.stack(
+        [_as_state_vector(mean, name="predicted_mean") for mean in predicted_means],
+        axis=0,
+    )
+    within_range = np.linalg.norm(predicted_states[:, :3], axis=1) <= float(detection_radius_m)
+    reference_indices = np.flatnonzero(np.asarray(track_active, dtype=bool) & within_range)
+    if reference_indices.size == 0:
+        return np.zeros((0, STATE_DIM), dtype=float), density_scores, reference_indices
+
+    reference_states = predicted_states[reference_indices]
+    reference_density_scores = _predicted_target_density_scores(
+        reference_states,
+        detection_radius_m=detection_radius_m,
+        full_probability_range_m=full_probability_range_m,
+    )
+    density_scores[reference_indices] = reference_density_scores
+    return reference_states, density_scores, reference_indices
+
+
+def _mixed_clutter_intensities(
+    candidate_states: np.ndarray,
+    *,
+    reference_states: np.ndarray,
+    reference_density_scores: np.ndarray,
+    detection_radius_m: float,
+    relative_velocity_limit_mps: float,
+    clutter_rate_per_second: float,
+    dt_seconds: float,
+    hotspot_probability: float,
+    hotspot_position_std_m: np.ndarray | Sequence[float],
+    hotspot_velocity_std_mps: np.ndarray | Sequence[float],
+) -> np.ndarray:
+    candidates = _as_state_batch(candidate_states, name="candidate_states")
+    if candidates.shape[0] == 0:
+        return np.zeros(0, dtype=float)
+
+    detection_radius = max(float(detection_radius_m), 1.0e-6)
+    velocity_support = max(float(relative_velocity_limit_mps), 1.0e-6)
+    position_volume = (4.0 / 3.0) * np.pi * detection_radius**3
+    velocity_volume = np.power(2.0 * velocity_support, 3)
+    measurement_volume = max(position_volume * velocity_volume, np.finfo(float).tiny)
+
+    inside_uniform_support = (
+        (np.linalg.norm(candidates[:, :3], axis=1) <= detection_radius)
+        & np.all(np.abs(candidates[:, 3:]) <= velocity_support, axis=1)
+    )
+    uniform_density = np.where(inside_uniform_support, 1.0 / measurement_volume, 0.0)
+
+    references = _as_state_batch(reference_states, name="reference_states")
+    pi_hotspot = float(np.clip(hotspot_probability, 0.0, 1.0))
+    if references.shape[0] == 0 or pi_hotspot <= 0.0:
+        mixture_density = uniform_density
+    else:
+        reference_density = np.asarray(reference_density_scores, dtype=float).reshape(-1)
+        if reference_density.shape != (references.shape[0],):
+            raise ValueError(
+                "reference_density_scores length must match reference_states rows, "
+                f"got {reference_density.shape[0]} and {references.shape[0]}."
+            )
+        hotspot_weights = 1.0 + np.clip(reference_density, 0.0, 1.0)
+        hotspot_weights /= float(np.sum(hotspot_weights))
+        hotspot_covariance_diagonal = np.square(
+            np.concatenate(
+                (
+                    np.asarray(hotspot_position_std_m, dtype=float).reshape(3),
+                    np.asarray(hotspot_velocity_std_mps, dtype=float).reshape(3),
+                )
+            )
+        )
+        residuals = candidates[:, None, :] - references[None, :, :]
+        hotspot_component_density = _gaussian_pdf_zero_mean_diag(
+            residuals.reshape(-1, STATE_DIM),
+            hotspot_covariance_diagonal,
+        ).reshape(candidates.shape[0], references.shape[0])
+        hotspot_density = hotspot_component_density @ hotspot_weights
+        mixture_density = (1.0 - pi_hotspot) * uniform_density + pi_hotspot * hotspot_density
+
+    clutter_rate_per_step = max(float(clutter_rate_per_second), 0.0) * max(float(dt_seconds), 1.0e-6)
+    return np.maximum(clutter_rate_per_step * mixture_density, np.finfo(float).tiny)
 
 
 def _gm_phd_transition_matrix(dt_seconds: float) -> np.ndarray:
@@ -1657,7 +1780,11 @@ def _build_bp_jpda_context(
     local_detection_probability: float,
     local_detection_probability_min: float,
     detection_full_probability_range_m: float,
+    detection_density_penalty_alpha: float,
     clutter_rate_per_second: float,
+    clutter_hotspot_probability: float,
+    clutter_hotspot_position_std_m: np.ndarray | Sequence[float],
+    clutter_hotspot_velocity_std_mps: np.ndarray | Sequence[float],
     recursive_motion_model: str,
     imm_model_types: Sequence[str],
     imm_model_transition_matrix: np.ndarray | Sequence[Sequence[float]] | None,
@@ -1731,17 +1858,37 @@ def _build_bp_jpda_context(
 
     candidate_states = local_relative_states[valid_indices] if valid_indices.size else np.zeros((0, STATE_DIM), dtype=float)
     likelihood_ratios = np.zeros((prior_relative_states.shape[0], valid_indices.size), dtype=float)
-
-    position_volume = (4.0 / 3.0) * np.pi * max(float(detection_radius_m), 1.0e-6) ** 3
-    velocity_support = max(float(relative_velocity_limit_mps), 1.0e-6)
-    velocity_volume = np.power(2.0 * velocity_support, 3)
-    measurement_volume = max(position_volume * velocity_volume, 1.0e-9)
-    clutter_rate_per_step = max(float(clutter_rate_per_second), 0.0) * max(float(dt_seconds), 1.0e-6)
-    clutter_intensity = max(clutter_rate_per_step / measurement_volume, 1.0e-9)
+    reference_states, target_density_scores, reference_indices = _bp_jpda_density_model_inputs(
+        predicted_means,
+        track_active,
+        detection_radius_m=detection_radius_m,
+        full_probability_range_m=detection_full_probability_range_m,
+    )
+    # Previous uniform-clutter approximation, kept for easy rollback:
+    # position_volume = (4.0 / 3.0) * np.pi * max(float(detection_radius_m), 1.0e-6) ** 3
+    # velocity_support = max(float(relative_velocity_limit_mps), 1.0e-6)
+    # velocity_volume = np.power(2.0 * velocity_support, 3)
+    # measurement_volume = max(position_volume * velocity_volume, 1.0e-9)
+    # clutter_rate_per_step = max(float(clutter_rate_per_second), 0.0) * max(float(dt_seconds), 1.0e-6)
+    # clutter_intensity = max(clutter_rate_per_step / measurement_volume, 1.0e-9)
+    clutter_intensities = _mixed_clutter_intensities(
+        candidate_states,
+        reference_states=reference_states,
+        reference_density_scores=target_density_scores[reference_indices],
+        detection_radius_m=detection_radius_m,
+        relative_velocity_limit_mps=relative_velocity_limit_mps,
+        clutter_rate_per_second=clutter_rate_per_second,
+        dt_seconds=dt_seconds,
+        hotspot_probability=clutter_hotspot_probability,
+        hotspot_position_std_m=clutter_hotspot_position_std_m,
+        hotspot_velocity_std_mps=clutter_hotspot_velocity_std_mps,
+    )
 
     for target_idx in range(prior_relative_states.shape[0]):
         if not track_active[target_idx] or valid_indices.size == 0:
             continue
+        # A current labeled report is fused into predicted_means above, so this
+        # report-corrected state is the center for both BP gating and likelihoods.
         predicted_mean = predicted_means[target_idx]
         predicted_covariance = predicted_covariances[target_idx]
         innovation_covariance_diagonal = np.diag(predicted_covariance) + local_covariance
@@ -1763,13 +1910,19 @@ def _build_bp_jpda_context(
             probability_near=local_detection_probability,
             probability_min=local_detection_probability_min,
             full_probability_range_m=detection_full_probability_range_m,
+            density_score=float(target_density_scores[target_idx]),
+            density_penalty_alpha=detection_density_penalty_alpha,
         )
         missed_detection_probability = max(
             1.0 - detection_probability,
             float(min_missed_detection_probability),
         )
+        # Previous uniform-clutter likelihood, kept for easy rollback:
+        # likelihood_ratios[target_idx, gated_offsets] = (
+        #     detection_probability * gaussian_likelihood / clutter_intensity
+        # ) / missed_detection_probability
         likelihood_ratios[target_idx, gated_offsets] = (
-            detection_probability * gaussian_likelihood / clutter_intensity
+            detection_probability * gaussian_likelihood / clutter_intensities[gated_offsets]
         ) / missed_detection_probability
 
     return _BPJPDAAgentContext(
@@ -1785,6 +1938,7 @@ def _build_bp_jpda_context(
         predicted_covariances=tuple(predicted_covariances),
         predicted_motion_states=tuple(predicted_motion_states),
         track_active=track_active,
+        report_valid_mask=prior_valid_mask.astype(bool, copy=True),
         likelihood_ratios=likelihood_ratios,
         previous_missed_counts=np.asarray(previous_missed_counts, dtype=int),
     )
@@ -1946,7 +2100,15 @@ def _build_bp_jpda_tracks_from_marginals(
         if context.valid_indices.size:
             full_weights[context.valid_indices] = marginals[target_idx].astype(np.float32)
         confidence = float(np.clip(np.sum(full_weights), 0.0, 1.0))
-        anchor_fallback_valid = bool(allow_anchor_fallback_valid and context.track_active[target_idx])
+        current_report_valid = bool(
+            allow_anchor_fallback_valid and context.report_valid_mask[target_idx]
+        )
+        # Previous range-bound fallback, kept for easy rollback:
+        # anchor_fallback_valid = bool(allow_anchor_fallback_valid and context.track_active[target_idx])
+        anchor_fallback_valid = bool(
+            allow_anchor_fallback_valid
+            and (context.track_active[target_idx] or current_report_valid)
+        )
         output_confidence = (
             max(confidence, float(confidence_threshold))
             if anchor_fallback_valid
@@ -1984,12 +2146,21 @@ def _build_bp_jpda_tracks_from_marginals(
         posterior_state, posterior_covariance = _collapse_motion_state(posterior_motion_state)
         posterior_covariance_diagonal = np.diag(posterior_covariance)
         has_weight_support = bool(np.any(full_weights > 0.0))
+        # Previous range-bound validity, kept for easy rollback:
+        # valid = bool(
+        #     context.track_active[target_idx]
+        #     and (
+        #         (confidence >= confidence_threshold and has_weight_support)
+        #         or anchor_fallback_valid
+        #     )
+        # )
         valid = bool(
-            context.track_active[target_idx]
-            and (
-                (confidence >= confidence_threshold and has_weight_support)
-                or anchor_fallback_valid
+            (
+                context.track_active[target_idx]
+                and confidence >= confidence_threshold
+                and has_weight_support
             )
+            or anchor_fallback_valid
         )
         if best_local_index < 0 and context.valid_indices.size:
             weight_support, nearest_index, nearest_distance = _nearest_measurement_support(
@@ -2019,10 +2190,20 @@ def _build_bp_jpda_tracks_from_marginals(
             )
         )
         has_measurement_support = bool(context.track_active[target_idx] and has_weight_support)
-        missed_count = _next_missed_count(
-            int(context.previous_missed_counts[target_idx]),
-            has_measurement_support=has_measurement_support,
-            max_missed_steps=max_missed_steps,
+        # Previous local-measurement-only missed-count update, kept for easy rollback:
+        # missed_count = _next_missed_count(
+        #     int(context.previous_missed_counts[target_idx]),
+        #     has_measurement_support=has_measurement_support,
+        #     max_missed_steps=max_missed_steps,
+        # )
+        missed_count = (
+            0
+            if current_report_valid
+            else _next_missed_count(
+                int(context.previous_missed_counts[target_idx]),
+                has_measurement_support=has_measurement_support,
+                max_missed_steps=max_missed_steps,
+            )
         )
         if has_measurement_support or missed_count < _sanitize_max_missed_steps(max_missed_steps):
             agent_next_states[target_idx] = BPJPDAFilterState(
@@ -2149,7 +2330,11 @@ def bp_jpda_association_for_friendlies(
     local_detection_probability: float,
     local_detection_probability_min: float,
     detection_full_probability_range_m: float,
+    detection_density_penalty_alpha: float,
     clutter_rate_per_second: float,
+    clutter_hotspot_probability: float,
+    clutter_hotspot_position_std_m: np.ndarray | Sequence[float],
+    clutter_hotspot_velocity_std_mps: np.ndarray | Sequence[float],
     recursive_motion_model: str = "imm",
     imm_model_types: Sequence[str] = ("cv", "ca", "ct_left", "ct_right"),
     imm_model_transition_matrix: np.ndarray | Sequence[Sequence[float]] | None = None,
@@ -2184,12 +2369,13 @@ def bp_jpda_association_for_friendlies(
     process_position_std = np.asarray(process_position_std_m, dtype=float).reshape(3)
     process_velocity_std = np.asarray(process_velocity_std_mps, dtype=float).reshape(3)
     confidence_threshold = float(np.clip(confidence_threshold, 0.0, 1.0))
-    position_volume = (4.0 / 3.0) * np.pi * max(float(detection_radius_m), 1.0e-6) ** 3
-    velocity_support = max(float(relative_velocity_limit_mps), 1.0e-6)
-    velocity_volume = np.power(2.0 * velocity_support, 3)
-    measurement_volume = max(position_volume * velocity_volume, 1.0e-9)
-    clutter_rate_per_step = max(float(clutter_rate_per_second), 0.0) * max(float(dt_seconds), 1.0e-6)
-    clutter_intensity = max(clutter_rate_per_step / measurement_volume, 1.0e-9)
+    # Previous uniform-clutter approximation, kept for easy rollback:
+    # position_volume = (4.0 / 3.0) * np.pi * max(float(detection_radius_m), 1.0e-6) ** 3
+    # velocity_support = max(float(relative_velocity_limit_mps), 1.0e-6)
+    # velocity_volume = np.power(2.0 * velocity_support, 3)
+    # measurement_volume = max(position_volume * velocity_volume, 1.0e-9)
+    # clutter_rate_per_step = max(float(clutter_rate_per_second), 0.0) * max(float(dt_seconds), 1.0e-6)
+    # clutter_intensity = max(clutter_rate_per_step / measurement_volume, 1.0e-9)
 
     outputs: dict[str, MultiTargetTrackOutput] = {}
     next_filter_states: dict[str, dict[int, BPJPDAFilterState]] = {}
@@ -2249,6 +2435,24 @@ def bp_jpda_association_for_friendlies(
 
         candidate_states = local_relative_states[valid_indices] if valid_indices.size else np.zeros((0, STATE_DIM), dtype=float)
         likelihood_ratios = np.zeros((prior_relative_states.shape[0], valid_indices.size), dtype=float)
+        reference_states, target_density_scores, reference_indices = _bp_jpda_density_model_inputs(
+            predicted_means,
+            track_active,
+            detection_radius_m=detection_radius_m,
+            full_probability_range_m=detection_full_probability_range_m,
+        )
+        clutter_intensities = _mixed_clutter_intensities(
+            candidate_states,
+            reference_states=reference_states,
+            reference_density_scores=target_density_scores[reference_indices],
+            detection_radius_m=detection_radius_m,
+            relative_velocity_limit_mps=relative_velocity_limit_mps,
+            clutter_rate_per_second=clutter_rate_per_second,
+            dt_seconds=dt_seconds,
+            hotspot_probability=clutter_hotspot_probability,
+            hotspot_position_std_m=clutter_hotspot_position_std_m,
+            hotspot_velocity_std_mps=clutter_hotspot_velocity_std_mps,
+        )
         for target_idx in range(prior_relative_states.shape[0]):
             if not track_active[target_idx] or valid_indices.size == 0:
                 continue
@@ -2273,13 +2477,19 @@ def bp_jpda_association_for_friendlies(
                 probability_near=local_detection_probability,
                 probability_min=local_detection_probability_min,
                 full_probability_range_m=detection_full_probability_range_m,
+                density_score=float(target_density_scores[target_idx]),
+                density_penalty_alpha=detection_density_penalty_alpha,
             )
             missed_detection_probability = max(
                 1.0 - detection_probability,
                 float(min_missed_detection_probability),
             )
+            # Previous uniform-clutter likelihood, kept for easy rollback:
+            # likelihood_ratios[target_idx, gated_offsets] = (
+            #     detection_probability * gaussian_likelihood / clutter_intensity
+            # ) / missed_detection_probability
             likelihood_ratios[target_idx, gated_offsets] = (
-                detection_probability * gaussian_likelihood / clutter_intensity
+                detection_probability * gaussian_likelihood / clutter_intensities[gated_offsets]
             ) / missed_detection_probability
 
         marginals = _run_bp_jpda(
@@ -2394,7 +2604,11 @@ def _anchored_bp_jpda_association_for_friendlies(
     local_detection_probability: float,
     local_detection_probability_min: float,
     detection_full_probability_range_m: float,
+    detection_density_penalty_alpha: float,
     clutter_rate_per_second: float,
+    clutter_hotspot_probability: float,
+    clutter_hotspot_position_std_m: np.ndarray | Sequence[float],
+    clutter_hotspot_velocity_std_mps: np.ndarray | Sequence[float],
     recursive_motion_model: str = "imm",
     imm_model_types: Sequence[str] = ("cv", "ca", "ct_left", "ct_right"),
     imm_model_transition_matrix: np.ndarray | Sequence[Sequence[float]] | None = None,
@@ -2446,7 +2660,11 @@ def _anchored_bp_jpda_association_for_friendlies(
             local_detection_probability=local_detection_probability,
             local_detection_probability_min=local_detection_probability_min,
             detection_full_probability_range_m=detection_full_probability_range_m,
+            detection_density_penalty_alpha=detection_density_penalty_alpha,
             clutter_rate_per_second=clutter_rate_per_second,
+            clutter_hotspot_probability=clutter_hotspot_probability,
+            clutter_hotspot_position_std_m=clutter_hotspot_position_std_m,
+            clutter_hotspot_velocity_std_mps=clutter_hotspot_velocity_std_mps,
             recursive_motion_model=recursive_motion_model,
             imm_model_types=imm_model_types,
             imm_model_transition_matrix=imm_model_transition_matrix,

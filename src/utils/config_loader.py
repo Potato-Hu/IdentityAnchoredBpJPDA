@@ -240,6 +240,22 @@ def get_initialization_config(path: str | Path | None = None) -> dict[str, Any]:
             initialization_config.get("key_enemy_initial_position_max_m"),
             name="initialization.key_enemy_initial_position_max_m",
         ),
+        "friendly_uav_initial_position_min_m": _read_optional_vector3(
+            initialization_config.get("friendly_uav_initial_position_min_m"),
+            name="initialization.friendly_uav_initial_position_min_m",
+        ),
+        "friendly_uav_initial_position_max_m": _read_optional_vector3(
+            initialization_config.get("friendly_uav_initial_position_max_m"),
+            name="initialization.friendly_uav_initial_position_max_m",
+        ),
+        "nonkey_enemy_initial_position_min_m": _read_optional_vector3(
+            initialization_config.get("nonkey_enemy_initial_position_min_m"),
+            name="initialization.nonkey_enemy_initial_position_min_m",
+        ),
+        "nonkey_enemy_initial_position_max_m": _read_optional_vector3(
+            initialization_config.get("nonkey_enemy_initial_position_max_m"),
+            name="initialization.nonkey_enemy_initial_position_max_m",
+        ),
         "nonkey_enemy": _read_distance_pair(
             initialization_config.get("nonkey_enemy_nearby_distance_m"),
             name="initialization.nonkey_enemy_nearby_distance_m",

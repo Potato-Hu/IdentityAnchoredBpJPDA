@@ -1,10 +1,10 @@
 entity_counts:
   # Number of friendly UAVs generated in each scene by default.
-  friendly_uavs: 3
+  friendly_uavs: 5
   # Number of key enemy targets generated in each scene by default.
   key_targets: 3
   # Number of non-key enemy targets generated in each scene by default.
-  nonkey_targets: 8
+  nonkey_targets: 20
 
 initialization:
   # Distance range in meters used when sampling non-key enemies near key targets.
@@ -12,15 +12,15 @@ initialization:
   # Distance range in meters used when sampling friendly UAVs around the key-target cluster.
   # The current sampler keeps friendlies near the shared key-target center, so increasing this
   # range spreads them out more while still preserving overlapping fields of view.
-  friendly_uav_nearby_distance_m: [10.0, 15.0]
-  # Minimum separation in meters enforced between sampled friendly UAV initial positions.
-  friendly_uav_min_separation_m: 15.0
+  # friendly_uav_nearby_distance_m: [20.0, 25.0]
+  # # Minimum separation in meters enforced between sampled friendly UAV initial positions.
+  # friendly_uav_min_separation_m: 20.0
 
 enemy_mobility:
   # Enemy motion model used to update target trajectories each simulation step.
   model: gauss_markov
   # Size of the 3D map in meters: [x_max, y_max, z_max].
-  bounds: [100.0, 100.0, 20.0]
+  bounds: [200.0, 200.0, 20.0]
   # Minimum distance kept from the map boundary when clipping positions.
   # This avoids agents being updated exactly onto the edge of the valid region.
   safety_margin: 1.0
@@ -69,13 +69,13 @@ global_sensing:
   # Standard MTT notation: this block defines the diagonal entries of the weak
   # external key-target prior covariance P^- for x_prior = [x, y, z, vx, vy, vz].
   # Position std in meters for [x, y, z].
-  prior_position_std_m: [5.0, 5.0, 2.0]
+  prior_position_std_m: [10.0, 10.0, 2.0]
   # Velocity std in meters per second for [vx, vy, vz].
-  prior_velocity_std_mps: [1, 1, 0.4]
+  prior_velocity_std_mps: [4, 4, 0.4]
   # Low-frequency sensor-frame bias drift standard deviation. This adds a small
   # common bias to every key-target prior for about 6 steps on average.
   prior_bias_position_std_m: [4, 4, 0.8]
-  prior_bias_velocity_std_mps: [0.5, 0.5, 0.1]
+  prior_bias_velocity_std_mps: [1, 1, 0.1]
   prior_bias_correlation_steps: 6.0
   # Per-key independent probability that one scheduled external report is absent.
   # Missing reports keep target labels stable via a valid mask.
@@ -83,7 +83,7 @@ global_sensing:
 
 local_sensing:
   # Omnidirectional detection radius in meters for each friendly UAV.
-  detection_radius_m: 50.0
+  detection_radius_m: 90.0
   # Friendly UAVs are not included in local target candidates.
   # Standard MTT notation: this block defines the diagonal entries of the local
   # measurement covariance R for z = [dx, dy, dz, dvx, dvy, dvz].
@@ -99,12 +99,15 @@ local_sensing:
   detection_probability_near: 0.95
   detection_probability_min: 0.50
   detection_full_probability_range_m: 20.0
-  detection_density_penalty_alpha: 0.5
+  detection_density_penalty_alpha: 0.1
   # Background false-alarm rate lambda_bg in the local sensing space. This remains
   # low because most ambiguity is already created by non-key targets.
   clutter_rate_per_second: 1
   # Make false alarms spatially local: when clutter is generated, most of it is
   # sampled near visible targets instead of uniformly over the whole sensing volume.
   clutter_hotspot_probability: 0.5
-  clutter_hotspot_position_std_m: [4.0, 4.0, 1.0]
-  clutter_hotspot_velocity_std_mps: [1.2, 1.2, 0.3]
+  # Standard deviations of the target-proximal Gaussian f_H around its anchor
+  # target in relative position [m] and relative velocity [m/s]. The BP-JPDA
+  # clutter likelihood uses the same values.
+  clutter_hotspot_position_std_m: [8.0, 8.0, 2.0]
+  clutter_hotspot_velocity_std_mps: [2, 2, 0.5]

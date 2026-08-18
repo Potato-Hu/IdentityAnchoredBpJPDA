@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
@@ -107,6 +108,7 @@ class SwarmEnv:
         distance_scale_m: float | None = None,
         tracking_input_mode: str | None = None,
         policy_input_mode: str | None = None,
+        association_method: str | None = None,
     ) -> None:
         self.key_num = int(get_num_key_targets() if key_num is None else key_num)
         self.nonkey_num = int(get_num_nonkey_targets() if nonkey_num is None else nonkey_num)
@@ -132,7 +134,10 @@ class SwarmEnv:
                 f"got {self.tracking_input_mode!r}."
             )
 
-        self.association_method = get_tracking_association_method()
+        resolved_association_method = (
+            get_tracking_association_method() if association_method is None else association_method
+        )
+        self.association_method = str(resolved_association_method).lower()
         if self.association_method not in ASSOCIATION_METHODS:
             raise ValueError(
                 "tracking.association_method must be one of 'none', 'bp_jpda', "
@@ -255,10 +260,14 @@ class SwarmEnv:
         self._last_local_observation_time_step: int | None = None
         self._last_association_outputs: dict[str, MultiTargetTrackOutput] | None = None
         self._last_association_time_step: int | None = None
+        self._last_association_runtime_s = 0.0
+        self._last_association_runtime_time_step: int | None = None
         self._last_local_track_sets: dict[str, LocalTrackSet] | None = None
         self._last_local_track_set_time_step: int | None = None
         self._last_fused_track_set: FusedTrackSet | None = None
         self._last_fused_time_step: int | None = None
+        self._last_fusion_runtime_s = 0.0
+        self._last_fusion_runtime_time_step: int | None = None
         self._last_task_assignment: TaskAssignmentResult | None = None
         self._last_task_assignment_time_step: int | None = None
         self._previous_task_assignment: TaskAssignmentResult | None = None
@@ -308,10 +317,14 @@ class SwarmEnv:
         self._last_local_observation_time_step = None
         self._last_association_outputs = None
         self._last_association_time_step = None
+        self._last_association_runtime_s = 0.0
+        self._last_association_runtime_time_step = None
         self._last_local_track_sets = None
         self._last_local_track_set_time_step = None
         self._last_fused_track_set = None
         self._last_fused_time_step = None
+        self._last_fusion_runtime_s = 0.0
+        self._last_fusion_runtime_time_step = None
         self._reset_task_assignment_cache()
         self._previous_task_assignment = None
         self._bp_jpda_filter_states = {agent_id: {} for agent_id in self.agent_ids}
@@ -447,6 +460,12 @@ class SwarmEnv:
             return None, None, None
         return states, covariances, valid_mask
 
+    def _record_association_runtime(self, start_time_s: float) -> None:
+        if self.world is None:
+            raise RuntimeError("reset() must be called before recording association runtime.")
+        self._last_association_runtime_s = float(time.perf_counter() - start_time_s)
+        self._last_association_runtime_time_step = int(self.world.time_step)
+
     def get_association_outputs(self) -> dict[str, MultiTargetTrackOutput]:
         """Return per-friendly multi-target local track posteriors for the current time step."""
 
@@ -456,7 +475,9 @@ class SwarmEnv:
             return {agent_id: output for agent_id, output in self._last_association_outputs.items()}
 
         if self.tracking_input_mode == "groundtruth":
+            association_start = time.perf_counter()
             outputs = self._build_groundtruth_track_outputs()
+            self._record_association_runtime(association_start)
             self._last_association_outputs = outputs
             self._last_association_time_step = self.world.time_step
             return {agent_id: output for agent_id, output in outputs.items()}
@@ -465,6 +486,7 @@ class SwarmEnv:
         friendly_states = self.world.get_friendly_states()
 
         if self.association_method == "prior_only":
+            association_start = time.perf_counter()
             previous_states, previous_covariances, previous_valid_mask = self._previous_fused_anchor_arrays(
                 num_key_targets=global_key_priors.states.shape[0]
             )
@@ -479,6 +501,7 @@ class SwarmEnv:
                 max_missed_steps=self.association_track_max_missed_steps,
                 prediction_confidence=self.gm_phd_confidence_threshold,
             )
+            self._record_association_runtime(association_start)
             self._last_association_outputs = outputs
             self._last_association_time_step = self.world.time_step
             return {agent_id: output for agent_id, output in outputs.items()}
@@ -486,17 +509,20 @@ class SwarmEnv:
         local_observations = self._get_current_local_observations()
 
         if self.association_method == "none":
+            association_start = time.perf_counter()
             outputs = nearest_local_candidate_association_for_friendlies(
                 friendly_states=friendly_states,
                 global_target_priors=global_key_priors,
                 local_observations=local_observations,
                 agent_ids=self.agent_ids,
             )
+            self._record_association_runtime(association_start)
             self._last_association_outputs = outputs
             self._last_association_time_step = self.world.time_step
             return {agent_id: output for agent_id, output in outputs.items()}
 
         if global_key_priors.states.size == 0:
+            association_start = time.perf_counter()
             empty_outputs = {
                 agent_id: empty_multi_target_track_output(
                     agent_id=agent_id,
@@ -512,11 +538,13 @@ class SwarmEnv:
             self._delta_glmb_filter_states = {
                 agent_id: DeltaGLMBFilterState(hypotheses=tuple()) for agent_id in self.agent_ids
             }
+            self._record_association_runtime(association_start)
             self._last_association_outputs = empty_outputs
             self._last_association_time_step = self.world.time_step
             return {agent_id: output for agent_id, output in empty_outputs.items()}
 
         if self.association_method == "bp_jpda":
+            association_start = time.perf_counter()
             outputs, next_filter_states = bp_jpda_association_for_friendlies(
                 friendly_states=friendly_states,
                 global_target_priors=global_key_priors,
@@ -532,7 +560,21 @@ class SwarmEnv:
                 detection_full_probability_range_m=float(
                     self.local_target_sensor.config.detection_full_probability_range_m
                 ),
-                clutter_rate_per_second=self.nominal_clutter_rate_per_second,
+                detection_density_penalty_alpha=float(
+                    self.local_target_sensor.config.detection_density_penalty_alpha
+                ),
+                # Previous independently tuned BP-JPDA clutter rate, kept for easy rollback:
+                # clutter_rate_per_second=self.nominal_clutter_rate_per_second,
+                clutter_rate_per_second=float(self.local_target_sensor.config.clutter_rate_per_second),
+                clutter_hotspot_probability=float(self.local_target_sensor.config.clutter_hotspot_probability),
+                clutter_hotspot_position_std_m=np.asarray(
+                    self.local_target_sensor.config.clutter_hotspot_position_std_m,
+                    dtype=float,
+                ),
+                clutter_hotspot_velocity_std_mps=np.asarray(
+                    self.local_target_sensor.config.clutter_hotspot_velocity_std_mps,
+                    dtype=float,
+                ),
                 recursive_motion_model=self.recursive_motion_model,
                 imm_model_types=self.imm_model_types,
                 imm_model_transition_matrix=self.imm_model_transition_matrix,
@@ -552,6 +594,7 @@ class SwarmEnv:
                 confidence_threshold=self.gm_phd_confidence_threshold,
             )
             self._bp_jpda_filter_states = next_filter_states
+            self._record_association_runtime(association_start)
             self._last_association_outputs = outputs
             self._last_association_time_step = self.world.time_step
             return {agent_id: output for agent_id, output in outputs.items()}
@@ -562,6 +605,7 @@ class SwarmEnv:
             "labeled_anchor_bp_jpda": labeled_anchor_bp_jpda_association_for_friendlies,
         }
         if self.association_method in anchor_methods:
+            association_start = time.perf_counter()
             outputs, next_filter_states = anchor_methods[self.association_method](
                 friendly_states=friendly_states,
                 global_target_priors=global_key_priors,
@@ -577,7 +621,21 @@ class SwarmEnv:
                 detection_full_probability_range_m=float(
                     self.local_target_sensor.config.detection_full_probability_range_m
                 ),
-                clutter_rate_per_second=self.nominal_clutter_rate_per_second,
+                detection_density_penalty_alpha=float(
+                    self.local_target_sensor.config.detection_density_penalty_alpha
+                ),
+                # Previous independently tuned BP-JPDA clutter rate, kept for easy rollback:
+                # clutter_rate_per_second=self.nominal_clutter_rate_per_second,
+                clutter_rate_per_second=float(self.local_target_sensor.config.clutter_rate_per_second),
+                clutter_hotspot_probability=float(self.local_target_sensor.config.clutter_hotspot_probability),
+                clutter_hotspot_position_std_m=np.asarray(
+                    self.local_target_sensor.config.clutter_hotspot_position_std_m,
+                    dtype=float,
+                ),
+                clutter_hotspot_velocity_std_mps=np.asarray(
+                    self.local_target_sensor.config.clutter_hotspot_velocity_std_mps,
+                    dtype=float,
+                ),
                 recursive_motion_model=self.recursive_motion_model,
                 imm_model_types=self.imm_model_types,
                 imm_model_transition_matrix=self.imm_model_transition_matrix,
@@ -597,11 +655,13 @@ class SwarmEnv:
                 confidence_threshold=self.gm_phd_confidence_threshold,
             )
             self._bp_jpda_filter_states = next_filter_states
+            self._record_association_runtime(association_start)
             self._last_association_outputs = outputs
             self._last_association_time_step = self.world.time_step
             return {agent_id: output for agent_id, output in outputs.items()}
 
         if self.association_method == "gm_phd":
+            association_start = time.perf_counter()
             outputs, next_filter_states = gm_phd_association_for_friendlies(
                 friendly_states=friendly_states,
                 global_target_priors=global_key_priors,
@@ -637,11 +697,13 @@ class SwarmEnv:
                 max_missed_steps=self.association_track_max_missed_steps,
             )
             self._gm_phd_filter_states = next_filter_states
+            self._record_association_runtime(association_start)
             self._last_association_outputs = outputs
             self._last_association_time_step = self.world.time_step
             return {agent_id: output for agent_id, output in outputs.items()}
 
         if self.association_method == "lmb":
+            association_start = time.perf_counter()
             outputs, next_filter_states = lmb_association_for_friendlies(
                 friendly_states=friendly_states,
                 global_target_priors=global_key_priors,
@@ -676,11 +738,13 @@ class SwarmEnv:
                 max_missed_steps=self.association_track_max_missed_steps,
             )
             self._lmb_filter_states = next_filter_states
+            self._record_association_runtime(association_start)
             self._last_association_outputs = outputs
             self._last_association_time_step = self.world.time_step
             return {agent_id: output for agent_id, output in outputs.items()}
 
         if self.association_method == "delta_glmb":
+            association_start = time.perf_counter()
             outputs, next_filter_states = delta_glmb_association_for_friendlies(
                 friendly_states=friendly_states,
                 global_target_priors=global_key_priors,
@@ -714,6 +778,7 @@ class SwarmEnv:
                 max_missed_steps=self.association_track_max_missed_steps,
             )
             self._delta_glmb_filter_states = next_filter_states
+            self._record_association_runtime(association_start)
             self._last_association_outputs = outputs
             self._last_association_time_step = self.world.time_step
             return {agent_id: output for agent_id, output in outputs.items()}
@@ -753,15 +818,32 @@ class SwarmEnv:
         if self._last_fused_time_step == self.world.time_step and self._last_fused_track_set is not None:
             return self._last_fused_track_set
 
+        self.get_association_outputs()
+        fusion_start = time.perf_counter()
         fused_track_set = self.fusion_center.fuse(
             timestamp=self.world.time_step,
             local_track_sets=self.get_local_track_sets(),
             friendly_states=self.world.get_friendly_states(),
             agent_ids=self.agent_ids,
         )
+        self._last_fusion_runtime_s = float(time.perf_counter() - fusion_start)
+        self._last_fusion_runtime_time_step = int(self.world.time_step)
         self._last_fused_track_set = fused_track_set
         self._last_fused_time_step = self.world.time_step
         return fused_track_set
+
+    def get_tracking_runtime_s(self) -> float:
+        """Return association, local-track construction, and fusion time for the current step."""
+
+        if self.world is None:
+            raise RuntimeError("reset() must be called before reading tracking runtime.")
+        self.get_fused_track_set()
+        current_step = int(self.world.time_step)
+        if self._last_association_runtime_time_step != current_step:
+            raise RuntimeError("Association runtime is unavailable for the current time step.")
+        if self._last_fusion_runtime_time_step != current_step:
+            raise RuntimeError("Fusion runtime is unavailable for the current time step.")
+        return float(self._last_association_runtime_s + self._last_fusion_runtime_s)
 
     def get_local_observations(self) -> dict[str, LocalTargetObservation]:
         """Return fixed-length local measurement sets for each friendly UAV."""
