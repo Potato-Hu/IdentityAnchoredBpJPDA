@@ -12,7 +12,7 @@ SwarmJam 是一个面向多无人机协同场景的**关键目标优先多目标
 - **多源感知建模**：生成带延迟、噪声和漏检的关键目标弱全局先验，以及带噪声、漏检和杂波的局部匿名观测。
 - **多目标数据关联**：实现最近邻、Surveillance-only、BP-JPDA、GM-PHD、LMB、δ-GLMB，以及多种先验锚定 BP-JPDA 方法。
 - **集中式航迹融合**：汇总各无人机的局部航迹，并通过一致性检查与协方差交叉融合得到全局关键目标航迹。
-- **协同跟踪闭环**：支持匈牙利任务分配和离散三维机动控制。
+- **协同跟踪闭环**：支持距离型任务分配（`hungarian` 配置模式）和离散三维机动控制。
 - **评估与可视化**：输出 RMSE、OSPA、GOSPA、跟踪覆盖率、ID Switch、航迹碎片数、运行时间、轨迹图和 CSV/NPZ 数据。
 
 系统流程：
@@ -40,7 +40,7 @@ SwarmJam 是一个面向多无人机协同场景的**关键目标优先多目标
 
 - Python 3.10–3.12
 - Windows、Linux 或 macOS
-- 主要依赖：PyTorch、Gymnasium、NumPy、Matplotlib、Seaborn、PyYAML
+- 主要依赖：NumPy、Matplotlib、Seaborn、PyYAML
 
 建议在项目根目录创建独立虚拟环境。
 
@@ -182,6 +182,8 @@ tracking:
 - `tracking.mode: local_only`：使用弱全局先验、局部匿名观测和关联算法，是默认研究模式。
 - `tracking.mode: groundtruth`：直接暴露关键目标真值航迹，仅用于调试或对照。
 - `tracking.assignment`：支持 `hungarian` 和 `placeholder`。
+
+当前 `hungarian` 模式对小规模分配使用排列穷举，对较大问题回退到贪心求解，不依赖 SciPy。
 
 可用的 `association_method`：
 

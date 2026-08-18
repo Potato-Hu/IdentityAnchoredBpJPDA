@@ -1,231 +1,186 @@
 # System Model
 
-## 1. Scope
+## 1. Scope and Implementation Status
 
-The current target architecture is a **centralized multi-UAV key-target tracking system** with the following end-to-end flow:
+SwarmJam implements a **centralized multi-UAV key-target tracking loop**. The current executable pipeline is:
 
-1. Ground-truth scene generation and motion update
-2. Weak external sensing of key-target priors
-3. Per-UAV local sensing of anonymous target candidates
-4. Local association and local key-track maintenance
-5. Central collection of per-UAV local key-track summaries
-6. Centralized track-to-track association and fusion
-7. Downstream task assignment and motion-control placeholders
+1. initialize and update a 3D ground-truth scene;
+2. generate delayed and noisy labeled priors for key targets;
+3. generate anonymous local measurements for every friendly UAV;
+4. run per-UAV association and recursive key-track estimation;
+5. transform local tracks to the global frame and fuse them centrally;
+6. assign fused key tracks to friendly UAVs;
+7. select discrete pursuit actions and advance the world;
+8. export trajectories, tracking metrics, runtime data, and figures.
 
-The system is no longer defined around MAPPO as the main modeling choice.
+The implementation is deterministic/statistical tracking code. It contains no reinforcement-learning policy, neural network, training loop, replay buffer, or learned association scorer.
 
----
+Main implementation entry points:
 
-## 2. Entities
+- environment: `src/env/swarm_env.py`
+- scene and motion: `src/simulation/`
+- sensing and association: `src/sensing/`
+- fusion, assignment, control, and metrics: `src/tracking/`
+- executable experiments: `src/runner/`
 
-### 2.1 Friendly UAVs
+## 2. Entities, State, and Dynamics
 
-- Count: `N_f`
-- State: 3D position and 3D velocity
-- Control: discrete motion action
+### 2.1 State
 
-The retained action space is:
+Every friendly UAV and enemy target uses a 6D kinematic state:
 
-- one `stop` action
-- 26 normalized 3D movement directions
+```text
+x = [px, py, pz, vx, vy, vz]
+```
 
-This action space is preserved for later task-assignment and tracking-control work.
+Enemy targets are divided into `key` and `non-key` roles. Only key targets receive persistent global labels and are evaluated as desired tracks. Non-key targets remain observable by local sensors and create association ambiguity.
 
-### 2.2 Enemy Targets
+### 2.2 Motion
 
-Targets are divided into:
+Enemy motion is configured per scenario and currently supports Gauss-Markov and random-walk models. Some scenarios additionally correlate or spatially partition non-key motion.
 
-- `key`
-- `non-key`
+Friendly UAVs use 27 discrete actions:
 
-Key targets are the objects of interest for tracking quality. Non-key targets exist mainly to increase ambiguity, clutter pressure, and identity confusion near key targets.
+- action `0`: stop;
+- 26 normalized directions from the Cartesian product of `{-1, 0, 1}` on three axes, excluding the all-zero direction.
 
----
+A selected direction is scaled by the configured friendly-UAV maximum speed. World updates clip positions to the configured 3D bounds.
 
-## 3. Scene Initialization
+### 2.3 Scene Initialization
 
-Implemented in `src/simulation/ground_truth.py`.
+Scene initialization is scenario-dependent. The base scenario places non-key targets near key targets and friendlies near the key-target region. Other included scenarios can use explicit sampling boxes, uniformly distributed non-key targets, or partitioned motion. Therefore, proximity-based initialization is not a universal system assumption.
 
-The intended initialization logic is:
+Relevant configuration is selected through `config/env.yaml` and resolved from `config/scenarios/*.yaml`.
 
-- key targets are placed within the scene bounds
-- non-key targets are generated near key targets so they act as realistic distractors
-- friendly UAVs are generated near the overall key-target region so they begin close enough to observe targets while still having overlapping fields of view
+## 3. Sensing Model
 
-This is intentionally different from a strict one-UAV-per-key-target initialization. The overlap is meant to support collaborative tracking rather than independent single-target pursuit.
+### 3.1 Weak Global Key-Target Priors
 
----
+`GlobalKeyTargetStatePriorSensor` in `src/sensing/global_sensor.py` produces labeled 6D reports for key targets only. The model includes:
 
-## 4. Sensing Model
+- a configurable reporting interval;
+- non-negative Gaussian delivery latency;
+- independent position and velocity noise;
+- a temporally correlated common bias;
+- per-key missed reports;
+- a validity mask;
+- diagonal reported covariance.
 
-### 4.1 External Key Priors
+When a delayed report arrives, its reported position is propagated to the current time with its reported velocity. The position covariance is enlarged using the report age. If no report arrives at a step, the returned prior rows are invalid rather than being treated as current truth.
 
-Implemented in `src/sensing/global_sensor.py`.
+The row index is the persistent key identity used by the labeled tracking methods.
 
-The external sensing source provides weak 6D priors for key targets:
+### 3.2 Local Anonymous Measurements
 
-- position mean
-- velocity mean
-- diagonal covariance
+`LocalTargetSensor` in `src/sensing/local_sensor.py` produces a variable-length set of relative 6D candidates for each friendly UAV:
 
-These priors are noisy and should be interpreted as coarse key-target hypotheses rather than exact global truth.
+```text
+z_ij = x_target_j - x_friendly_i + measurement noise
+```
 
-Their role is to:
+The local sensor:
 
-- seed or stabilize key-track hypotheses
-- preserve key-target semantics
-- support local association under ambiguity
+- observes both key and non-key targets inside its detection radius;
+- removes target IDs and key/non-key roles;
+- applies range- and local-density-dependent detection probability;
+- adds position and velocity measurement noise;
+- draws the clutter count from a Poisson distribution;
+- mixes uniform clutter with target-proximal hotspot clutter.
 
-### 4.2 Local Sensor
+`LocalTargetObservation` contains `relative_states`, a validity `mask`, and the diagonal measurement covariance. The current sensor returns only valid rows, so the array length may differ across UAVs and time steps.
 
-Implemented in `src/sensing/local_sensor.py`.
+## 4. Local Association and Recursive Tracking
 
-Each UAV receives a fixed-length local candidate set containing:
+`SwarmEnv` supports two tracking input modes:
 
-- relative 6D candidate states
-- a validity mask
-- local measurement covariance
+- `local_only`: run the configured local association method using weak priors and local measurements;
+- `groundtruth`: construct key tracks from truth for debugging and reference comparisons.
 
-Properties of the local sensing model:
+Available `local_only` association methods are:
 
-- limited detection radius
-- probabilistic missed detections
-- additive measurement noise
-- clutter generation
-- no target id
-- no explicit key / non-key label
+| Configuration value | Implemented behavior |
+| --- | --- |
+| `none` | nearest-local-candidate baseline |
+| `prior_only` | labeled external reports plus motion prediction, without local candidates |
+| `bp_jpda` | recursive BP-JPDA |
+| `hard_anchor_bp_jpda` | BP-JPDA centered directly on the current labeled prior |
+| `covariance_anchor_bp_jpda` | covariance-fused labeled anchor without fallback validity |
+| `labeled_anchor_bp_jpda` | covariance-fused labeled anchor with fallback validity |
+| `gm_phd` | per-UAV GM-PHD recursive baseline |
+| `lmb` | labeled multi-Bernoulli-style recursive baseline |
+| `delta_glmb` | compact labeled multi-hypothesis baseline |
 
-Therefore, each UAV observes only anonymous local candidates.
+Recursive estimators support either:
 
----
+- `cv`: one constant-velocity model;
+- `imm`: an interacting multiple-model bank. The default bank is `cv`, `ca`, `ct_left`, and `ct_right`.
 
-## 5. Local Association and Local Tracking
+The estimator motion model is independent of the ground-truth mobility model, allowing deliberate model mismatch. Tracks are removed after the configured number of consecutive unsupported steps.
 
-Implemented mainly in `src/sensing/association.py`.
+Each per-UAV output is a `MultiTargetTrackOutput` containing one `KeyTrackPosterior` per key label, with prior and posterior relative state, covariance diagonal, confidence/existence, validity, and optional local-candidate association information.
 
-The local association layer is intended to consume:
+## 5. Centralized Fusion
 
-- weak key-target priors
-- current local candidate observations
-- previous local track hypotheses
+The fusion pipeline is implemented in `src/tracking/fusion_center.py` and `src/tracking/fusion.py`.
 
-and produce:
+For every valid local posterior:
 
-- local key-target posterior track summaries
+1. convert the relative state to the global frame by adding the friendly-UAV state;
+2. add configured friendly-UAV localization uncertainty to position covariance;
+3. group candidates by `global_target_index`;
+4. discard candidates below `track_fusion.min_confidence`;
+5. reject inconsistent candidates with a Mahalanobis-distance gate;
+6. combine accepted estimates sequentially with covariance intersection.
 
-Supported baseline families include:
+Fusion is label-guided rather than a general unlabeled cross-UAV assignment: local tracks are first grouped by their persistent key index. If no valid candidate survives for a label, the fusion output retains an invalid prior-based fallback state.
 
-- nearest-candidate style matching
-- JPDA-style soft association
-- GM-PHD-style recursive estimation
+The resulting `FusedTrack` stores the label, global mean and covariance, contributing UAVs, fused confidence/existence, and validity.
 
-For the recursive baselines, the local motion prior is now configurable:
+The fusion interface assumes synchronous, lossless availability of all local track summaries. It does not model packets, bandwidth, link delay, or distributed consensus.
 
-- `cv`: single constant-velocity prediction
-- `imm`: an interacting multiple-model predictor with a default bank of `cv`, `ca`, `ct_left`, and `ct_right`
+## 6. Assignment and Motion Control
 
-This is intentionally separate from the ground-truth enemy mobility. The environment may evolve targets with a
-Gauss-Markov motion process while the local recursive estimators propagate key-track hypotheses with an approximate
-CV or IMM kinematic prior before association and measurement update.
+Task assignment and motion control are implemented, not placeholders in the default configuration.
 
-The target research direction is not symmetric target association. It is **priority-aware association**, where:
+- `tracking.assignment: hungarian` builds a distance cost matrix using one-step predicted fused target positions and adds a switching penalty based on the previous assignment.
+- The implementation solves small assignments by exact permutation search and falls back to a greedy solver for larger or rectangular cases; `hungarian` is the configuration name, not a dependency on SciPy's Hungarian implementation.
+- When there are more UAVs than tracks, remaining UAVs are assigned to their nearest track.
+- `tracking.assignment: placeholder` returns no assignments.
 
-- key-target continuity matters more than target symmetry
-- identity consistency for key tracks is emphasized
-- non-key targets are treated primarily as confusing distractors
+`build_tracking_control_commands` chooses the discrete direction with the largest dot product toward the assigned valid fused track. An unassigned UAV, or a UAV whose assigned track is invalid/missing, receives the stop action.
 
-The intended algorithmic extension is a **learned scoring front-end** for the classical recursive estimators already
-present in the repository. Rather than replacing the full filter, the learned module should use temporal context, weak
-global priors, local multi-candidate observations, and uncertainty to adjust:
+## 7. Interference Quantities
 
-- track-candidate association strengths
-- missed-detection branches
-- existence-confidence updates
+`src/interference/channel.py` computes free-space-path-loss received-power snapshots at key targets and friendly UAVs. These values are stored in rollouts and exposed in environment information, but they are not currently part of the association likelihood, assignment cost, or control action.
 
-The corrected scores then flow into a classical backend such as `JPDA` or `LMB`.
+## 8. Evaluation and Experiment Outputs
 
----
+`src/tracking/metrics.py` implements and exports:
 
-## 6. Central Fusion Layer
+- per-key position error and valid-track position RMSE;
+- coverage-penalized RMSE;
+- OSPA and GOSPA;
+- tracked-target count and ratio;
+- cumulative and per-target ID switches;
+- cumulative and per-target fragmentations.
 
-This layer is the core centralized extension of the local estimators.
+Tracking runtime is measured as association time plus fusion time for each step.
 
-Each UAV exports a local key-track summary to an ideal central fusion controller instead of broadcasting raw measurements to peers. The central layer then performs:
+Executable workflows:
 
-1. cross-UAV track-to-track association
-2. track consistency checking
-3. centralized fusion of matching key tracks
+- `python main.py`: scene and trajectory visualization only;
+- `python -m src.runner.export_tracking_rollout --no-show`: one closed-loop tracking rollout;
+- `python -m src.runner.run_tracking_monte_carlo --num-seeds N`: paired-seed method comparison;
+- `python -m src.runner.run_nonkey_density_sweep --num-seeds N`: non-key/key density sweep for `labeled_anchor_bp_jpda`.
 
-Expected outputs:
+## 9. Current Modeling Boundaries
 
-- fused key-target state means
-- fused covariances
-- confidence / existence scores
-- identity-consistency metadata
+The current repository does not implement:
 
-This keeps the architecture compatible with standard tracking baselines while keeping the repository focused on estimation, fusion, and downstream assignment rather than communication-protocol implementation.
+- reinforcement learning or any learned model;
+- raw-measurement sharing between UAVs;
+- a communication protocol or bandwidth model;
+- continuous UAV control or transmit-power actions;
+- a fully unlabeled cross-UAV track-association solver.
 
-The current code models this as an **ideal centralized interface**:
-
-- every friendly UAV's local track set is synchronously available to the fusion center
-- no explicit packet format, bandwidth budget, or wireless-link simulator is modeled
-- the fusion center returns one `FusedTrackSet` back to the rest of the system
-
----
-
-## 7. Task Assignment and Motion Control
-
-Task assignment and control are downstream modules and are not yet algorithmically filled in.
-
-The intended interfaces are:
-
-- **task assignment**: map fused key tracks to friendly UAV responsibilities
-- **motion control**: map assigned key tracks to discrete UAV actions
-
-The placeholders should preserve the current UAV action space and allow future replacement by:
-
-- rule-based tracking control
-- optimization-based assignment
-- learning-based control if needed later
-
----
-
-## 8. Evaluation Quantities
-
-The primary quantities of interest are key-target-centric:
-
-- key-target OSPA
-- key-target RMSE
-
-Recommended diagnostic quantities:
-
-- key-track continuity
-- identity-switch count
-- missed-track duration
-
-At present, the repository directly exports `key-target RMSE` and `key-target OSPA`. For the priority-aware learned
-association direction, the continuity and identity diagnostics should become first-class reporting metrics rather than
-only secondary summaries.
-
-The system is therefore evaluated as a key-target tracking system, not primarily as a reward-optimization environment.
-
----
-
-## 9. Repository Orientation
-
-After the modeling shift, the repository should be interpreted as containing three categories of code:
-
-1. **core tracking code**
-   - scene generation
-   - sensing
-   - association
-   - centralized fusion
-
-2. **downstream placeholders**
-   - task assignment
-   - motion control
-
-3. **tracking rollout and visualization utilities**
-   - export scripts
-   - plotting
-   - diagnostic summaries
+Within those boundaries, scene generation, sensing, local association, recursive tracking, centralized fusion, assignment, pursuit control, metrics, and experiment export are all executable.

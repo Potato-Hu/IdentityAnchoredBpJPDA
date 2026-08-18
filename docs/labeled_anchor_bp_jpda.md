@@ -1,221 +1,206 @@
 # Labeled-Anchor BP-JPDA Design Notes
 
-## Motivation
+## 1. Implementation Status
 
-The baseline BP-JPDA keeps one recursive local track per key target and computes a
-target-candidate likelihood matrix from Mahalanobis-gated Gaussian likelihoods. This works
-well when the local recursive track remains close to the correct key target, but in clutter-heavy
-scenes a key label can be pulled toward non-key candidates. Once that happens, the next BP-JPDA
-step gates around the wrong local posterior and the error can persist.
+`labeled_anchor_bp_jpda` is an implemented deterministic association and recursive-tracking method in `src/sensing/association.py`. It combines:
 
-The delta-GLMB baseline is better at preserving target identity because each target is explicitly
-labeled, but it is more complex and produced weaker behavior for some other key targets in the
-current scenarios. `labeled_anchor_bp_jpda` keeps the BP-JPDA association machinery and adds only
-a light label anchor:
+- persistent key identities from ordered global-prior rows;
+- CV or IMM motion prediction;
+- covariance-aware fusion of the motion prediction and current labeled prior;
+- Mahalanobis-gated BP-JPDA over anonymous local candidates;
+- an anchor-based fallback-validity rule.
 
-- key target `E1` keeps label `l1` through global target index `0`;
-- key target `E2` keeps label `l2` through global target index `1`;
-- key target `E3` keeps label `l3` through global target index `2`;
-- BP-JPDA still estimates target-candidate association marginals, but each target's prediction is
-  anchored to the current global prior for that same label.
+It contains no neural network, learned embedding, supervised training, reinforcement learning, or trainable parameter.
 
-The method does not solve a delta-GLMB-style label-to-measurement hypothesis problem. It relies on
-the global prior's key-target order as the persistent identity source.
+The plotting code labels this method `IA-BP-JPDA`.
 
-## Method Summary
+## 2. Motivation
 
-For every friendly UAV and key target label, the method builds a labeled anchor prediction before
-running BP-JPDA:
+The baseline `bp_jpda` maintains one recursive local state per key index. In clutter-heavy scenes, a local posterior can be pulled toward a non-key target or false alarm. Because the next prediction is based mainly on that recursive state, later gates may remain centered on the wrong object.
 
-```text
-previous local posterior -> IMM/CV motion prediction -> x_motion, P_motion
-current global prior for the same label -> x_prior, P_prior
-covariance-aware anchor fusion -> x_anchor, P_anchor
-BP-JPDA gating/likelihood around x_anchor, P_anchor
-```
+The external global sensor already preserves the semantic order of key targets. Labeled-anchor BP-JPDA uses that ordered prior as a persistent identity reference while retaining soft local candidate competition through BP-JPDA.
 
-If no previous local state exists, the current global prior initializes the local recursive state.
-If the current global prior is unavailable, the method falls back to the recursive motion
-prediction. This keeps the tracker usable under occasional global-prior misses.
+The method does not maintain delta-GLMB-style joint label-assignment hypotheses. Label identity is inherited from `global_target_index`, i.e. global-prior row `k` corresponds to local key track `k` and fused label `E{k+1}`.
 
-## Covariance-Aware Anchor Fusion
+## 3. Inputs and Per-UAV State
 
-When both the recursive motion prediction and the current global prior are available, the anchor is
-formed by a covariance-aware Kalman/information update. Conceptually:
+For every friendly UAV, the method consumes:
+
+- the UAV's 6D global state;
+- the current `GlobalKeyTargetStatePrior`;
+- the current variable-length `LocalTargetObservation`;
+- the previous `BPJPDAFilterState` for each key index;
+- sensing, clutter, gating, recursion, and IMM parameters.
+
+A local recursive state contains a mean, full covariance, optional per-model IMM bank, and consecutive missed-step count. The exported `KeyTrackPosterior` contains the prior/posterior relative states, covariance diagonals, confidence/existence, validity, and candidate-association information.
+
+## 4. Labeled Prediction
+
+For key index `k`, the global prior is first converted to the UAV-relative frame. The prediction logic is:
 
 ```text
-P_anchor^-1 = P_motion^-1 + P_prior^-1
-x_anchor = P_anchor * (P_motion^-1 x_motion + P_prior^-1 x_prior)
+previous local state
+    → CV/IMM propagation
+    → motion prediction (x_motion, P_motion)
+
+current valid global-prior row k
+    → relative labeled anchor (x_prior, P_prior)
+
+motion prediction + labeled anchor
+    → covariance-aware anchor (x_anchor, P_anchor)
 ```
 
-Equivalently, the implementation applies a linear Kalman update to each IMM motion-model branch,
-using the global prior as a full-state measurement with covariance `P_prior`.
+The edge cases implemented by `_bp_jpda_predict_track_state` are:
 
-This is different from a fixed weighted average:
+- no previous state + valid prior: initialize the recursive state from the prior;
+- previous state + missing prior: use motion prediction only;
+- no previous state + missing prior: mark the track inactive in the BP context;
+- expired previous state: treat it as absent.
 
-```text
-x_anchor = alpha * x_prior + (1 - alpha) * x_motion
-```
+### 4.1 Covariance-Aware Fusion
 
-There is no manually tuned `alpha`. The covariance matrices determine the relative influence:
+For each IMM branch, the global prior is treated as a full-state identity observation. Conceptually, for independent Gaussian inputs:
 
-- smaller covariance means higher confidence and stronger influence;
-- larger covariance means lower confidence and weaker influence;
-- the fused covariance becomes the uncertainty used by the later likelihood and gate.
+$$
+P_a^{-1} = P_m^{-1} + P_p^{-1},
+$$
 
-Compared with the earlier hard-anchor version, this avoids discarding temporal continuity. The
-global prior still pulls each label back to its intended target, but the previous local trajectory
-continues to contribute when it is statistically reliable.
+$$
+x_a = P_a(P_m^{-1}x_m + P_p^{-1}x_p).
+$$
 
-## BP-JPDA Association Stage
+The branch probabilities and Gaussian bank are then collapsed into the anchor mean and covariance used by BP-JPDA.
 
-After the labeled anchor is built, the method uses the existing BP-JPDA graph:
+There is no fixed interpolation coefficient. A lower covariance gives the corresponding input more influence.
 
-```text
-residual_ij = z_j - x_anchor_i
-S_ij = P_anchor_i + R_local
-d2_ij = residual_ij^T S_ij^-1 residual_ij
-```
+## 5. Gating and BP-JPDA Likelihood
 
-Edges are created only for candidates inside the Mahalanobis gate:
+For target `k` and local candidate `j`, the implementation uses the anchor-centered residual
 
-```text
-d2_ij <= gate_sigma^2
-```
+$$
+r_{kj} = z_j - x_{a,k}.
+$$
 
-For gated edges, the likelihood ratio is the same BP-JPDA form used by the baseline:
+The code forms a diagonal innovation covariance from the anchor covariance diagonal and local measurement covariance:
 
-```text
-psi_ij = P_D * N(z_j ; x_anchor_i, S_ij) / clutter_intensity / P_missed
-```
+$$
+S_{k} = \operatorname{diag}(P_{a,k}) + R.
+$$
 
-The loopy BP solver then computes approximate JPDA association marginals over the labeled
-target-candidate graph. The downstream Gaussian mixture update is reused unchanged.
+A candidate edge is retained when
 
-The key difference from baseline BP-JPDA is the prediction center. Baseline BP-JPDA gates around
-the recursive local posterior, which can drift. `labeled_anchor_bp_jpda` gates around the
-covariance-fused labeled anchor.
+$$
+d^2_{kj} = r_{kj}^T S_k^{-1}r_{kj} \leq \gamma^2,
+$$
 
-## Anchor Fallback Validity
+where `gamma` is `association.bp_jpda_gate_sigma`.
 
-In clutter-heavy scenes, requiring a local measurement association at every step creates
-fragmented tracks. A key target can have a reasonable labeled anchor prediction but no confident
-local candidate in one UAV's view. If that track is marked invalid, CI fusion and Hungarian
-assignment may temporarily lose the target, causing the controller to stop pursuing it.
+For retained edges, the likelihood ratio has the implemented form
 
-For this reason, `labeled_anchor_bp_jpda` enables an anchor fallback validity rule:
+$$
+\psi_{kj} = \frac{P_D\,\mathcal{N}(r_{kj};0,S_k)}{\lambda_c(z_j)\,P_{miss}}.
+$$
 
-```text
-if BP has measurement support:
-    output the normal BP-JPDA posterior
-else if the labeled anchor is active:
-    output the anchor prediction as a low-confidence valid track
-```
+`P_D` depends on range and local target density. `P_miss` is lower-bounded by the configured minimum missed-detection probability. The clutter intensity `lambda_c` uses the same uniform/hotspot mixture family as the local sensor rather than a single uniform constant.
 
-The fallback confidence is clamped to the configured local confidence threshold, so it can pass the
-fusion `min_confidence` check without pretending to be high-confidence measurement evidence.
+The loopy BP routine `_run_bp_jpda` iterates until the configured tolerance or iteration limit and returns approximate target-candidate marginals.
 
-This rule is intentionally enabled only for `labeled_anchor_bp_jpda`. The ordinary `bp_jpda`,
-`hard_anchor_bp_jpda`, and `covariance_anchor_bp_jpda` paths require local measurement support.
+## 6. Posterior Update
 
-## Why Gating Still Remains
+For each target, `_build_bp_jpda_tracks_from_marginals` builds a Gaussian mixture containing:
 
-Covariance-aware fusion answers the question:
+- a missed-detection branch based on the predicted anchor state;
+- one measurement-updated branch for every candidate with positive BP marginal.
 
-```text
-Where should label i be now, and with what uncertainty?
-```
+The branches are moment-matched back into the recursive CV/IMM state. Local confidence is the clipped sum of candidate marginals, and the current implementation sets existence probability to the same output confidence.
 
-Gating answers a different question:
+A normal BP-supported track is valid only when:
 
-```text
-Which local candidates are statistically plausible for label i?
-```
+- the track is active;
+- association confidence reaches the configured confidence threshold;
+- at least one candidate has positive association support.
 
-Without gating, all clutter candidates would still enter the association graph and dilute BP-JPDA
-association probability. The fused anchor defines the center and covariance; gating uses that
-distribution to keep the target-candidate graph sparse and physically plausible.
+## 7. Anchor Fallback Validity
 
-## Relationship to Other Association Methods
+`labeled_anchor_bp_jpda` additionally calls the posterior builder with `allow_anchor_fallback_valid=True`. A track can therefore remain valid without local measurement support when either:
 
-### Baseline BP-JPDA
+- its predicted track remains active; or
+- the current labeled global report is valid.
 
-Baseline BP-JPDA:
+For a fallback-valid output:
 
-```text
-previous posterior -> motion/prior prediction -> BP-JPDA
-```
+- posterior state remains the anchor/motion prediction when no candidate contributes;
+- output confidence is floored at the association confidence threshold;
+- a valid current global report resets the missed-step counter;
+- otherwise the missed-step counter advances and the recursive state is eventually removed at `association_track_max_missed_steps`.
 
-The global prior acts as a weak recursive correction through the existing anchor/birth mechanism.
-If the previous posterior is already biased by clutter, the next gate can remain biased.
+The fusion layer applies its own independent `track_fusion.min_confidence` threshold, so fallback validity does not bypass fusion configuration.
 
-### Labeled-Anchor BP-JPDA
+This rule improves labeled-track availability for fusion, assignment, and pursuit control, but it can retain a biased prior-supported state when local evidence is absent. Coverage and position accuracy must therefore be reported together.
 
-Labeled-anchor BP-JPDA:
+## 8. Relationship to the Other BP-JPDA Modes
 
-```text
-previous posterior -> motion prediction
-current global prior for same key label
-motion/prior covariance fusion -> BP-JPDA
-anchor fallback valid output
-```
+| Method | Prediction center | Requires local measurement support | Anchor fallback |
+| --- | --- | --- | --- |
+| `bp_jpda` | recursive prediction with the baseline anchor/birth correction | yes | no |
+| `hard_anchor_bp_jpda` | current valid labeled prior replaces the recursive prediction | yes | no |
+| `covariance_anchor_bp_jpda` | covariance-fused motion prediction and labeled prior | yes | no |
+| `labeled_anchor_bp_jpda` | covariance-fused motion prediction and labeled prior | no, when fallback conditions hold | yes |
 
-The label identity comes from the global prior row index, while BP-JPDA still handles local
-candidate competition.
+All four modes reuse the BP graph, gating, clutter model, marginal solver, and Gaussian-mixture posterior machinery. Their main differences are how the prediction is anchored and whether an unsupported anchor may still be exported as valid.
 
-### Delta-GLMB
+## 9. Central Fusion Interaction
 
-Delta-GLMB explicitly maintains labeled multi-target hypotheses and measurement assignment
-hypotheses. `labeled_anchor_bp_jpda` deliberately avoids that complexity. It borrows only the
-practical idea that each key target should have a stable label identity.
+Each local labeled posterior is transformed to the global frame by adding the friendly-UAV state and localization covariance. Fusion then:
 
-## Implementation Points
+1. groups tracks by the same `global_target_index`;
+2. filters by confidence;
+3. rejects Mahalanobis-inconsistent contributors;
+4. combines accepted estimates by covariance intersection.
 
-The implementation lives in `src/sensing/association.py`:
+Stable label grouping is therefore supplied before CI fusion; the fusion center does not rediscover labels from unlabeled local tracks.
 
-- `_covariance_fuse_motion_state_with_anchor(...)` performs the covariance-aware anchor update for
-  each IMM branch.
-- `_bp_jpda_predict_track_state(..., covariance_anchor_prior=True)` selects covariance-aware
-  anchoring for labeled-anchor mode.
-- `_build_bp_jpda_context(..., anchor_to_global_prior=True)` builds BP-JPDA likelihoods around the
-  labeled anchor.
-- `_build_bp_jpda_tracks_from_marginals(..., allow_anchor_fallback_valid=True)` enables the
-  anchor fallback validity rule.
-- `labeled_anchor_bp_jpda_association_for_friendlies(...)` wires the above pieces into a separate
-  association method.
+## 10. Implementation Map
 
-The environment entry is registered as:
+The relevant functions in `src/sensing/association.py` are:
+
+- `_covariance_fuse_motion_state_with_anchor`: fuses the prior into each motion-model branch;
+- `_bp_jpda_predict_track_state`: handles initialization, propagation, hard anchoring, and covariance anchoring;
+- `_build_bp_jpda_context`: builds active tracks, gates, clutter intensities, and likelihood ratios;
+- `_run_bp_jpda`: computes approximate association marginals;
+- `_build_bp_jpda_tracks_from_marginals`: performs mixture update, validity, confidence, and missed-count handling;
+- `_anchored_bp_jpda_association_for_friendlies`: common driver for the three anchored variants;
+- `labeled_anchor_bp_jpda_association_for_friendlies`: enables covariance anchoring and fallback validity.
+
+Enable the method in `config/env.yaml`:
 
 ```yaml
 tracking:
+  mode: local_only
   association_method: labeled_anchor_bp_jpda
 ```
 
-No neural network, supervised training, learned embedding, or large set of manual weights is
-introduced.
+Key parameters are under `association` and `track_fusion` in the same file.
 
-## Observed Effect in the Clutter-Heavy Scenario
+## 11. Evaluation Guidance and Limitations
 
-In `scenerios_many_nonkey_partitioned`, the earlier hard-anchor version reduced identity drift but
-created intermittent invalid tracks. That produced high fragmentation and allowed the controller to
-temporarily stop pursuing a key target.
+Compare association methods with the same scene configuration and paired random seeds. Report at least:
 
-After covariance-aware fusion and anchor fallback validity, the labeled-anchor method produced:
+- GOSPA or OSPA;
+- valid-only and coverage-penalized position error;
+- tracked-target coverage;
+- ID switches;
+- fragmentations;
+- association-plus-fusion runtime.
 
-```text
-mean_coverage = 100.0%
-final_coverage = 3/3
-id_switches = 0
-fragmentations = 0
-```
+Do not interpret fallback coverage alone as evidence of accurate local measurement tracking.
 
-The E3 nearest-friendly-distance spike was also reduced in the tested rollout:
+Current limitations:
 
-```text
-hard anchor peak:              about 40.55 m
-covariance-aware + fallback:   about 15.66 m
-```
+- correctness of key identity depends on stable global-prior row ordering;
+- anchor fusion assumes the motion prediction and global prior can be combined as modeled;
+- local gating uses diagonal innovation covariance;
+- fallback validity can trade position accuracy for continuity;
+- the method is not learned and does not adapt parameters from data.
 
-The tradeoff is that fallback-valid tracks may slightly increase RMSE when no local measurement
-supports the anchor in that step. This is intentional: the method favors continuous labeled target
-availability for downstream CI fusion, Hungarian assignment, and controller stability.
+No fixed performance numbers are part of this design specification; results depend on scenario, seed, and configuration and should be generated through the repository's rollout or Monte Carlo runners.

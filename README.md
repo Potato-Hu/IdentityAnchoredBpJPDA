@@ -12,7 +12,7 @@ SwarmJam is a **key-target-prioritized multi-target tracking and data-associatio
 - **Multi-source sensing:** delayed, noisy, and occasionally missed global key-target priors, plus noisy local anonymous observations with missed detections and clutter.
 - **Multi-target data association:** nearest-neighbor, surveillance-only, BP-JPDA, GM-PHD, LMB, δ-GLMB, and several prior-anchored BP-JPDA variants.
 - **Centralized track fusion:** consistency checking and covariance-intersection fusion of local UAV tracks into global key-target tracks.
-- **Cooperative tracking loop:** Hungarian task assignment and discrete 3D motion control.
+- **Cooperative tracking loop:** distance-based assignment (`hungarian` configuration mode) and discrete 3D motion control.
 - **Evaluation and visualization:** RMSE, OSPA, GOSPA, tracking coverage, ID switches, fragmentations, runtime, trajectory plots, and CSV/NPZ exports.
 
 System flow:
@@ -40,7 +40,7 @@ System flow:
 
 - Python 3.10–3.12
 - Windows, Linux, or macOS
-- Main dependencies: PyTorch, Gymnasium, NumPy, Matplotlib, Seaborn, and PyYAML
+- Main dependencies: NumPy, Matplotlib, Seaborn, and PyYAML
 
 Create an isolated virtual environment from the project root.
 
@@ -182,6 +182,8 @@ tracking:
 - `tracking.mode: local_only` uses weak global priors, anonymous local observations, and an association algorithm. This is the default research mode.
 - `tracking.mode: groundtruth` exposes key-target ground-truth tracks directly and is intended only for debugging or reference comparisons.
 - `tracking.assignment` supports `hungarian` and `placeholder`.
+
+The current `hungarian` mode uses exact permutation search for small assignments and a greedy fallback for larger cases; it does not require SciPy.
 
 Available `association_method` values:
 
