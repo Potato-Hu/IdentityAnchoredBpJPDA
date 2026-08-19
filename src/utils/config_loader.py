@@ -586,7 +586,7 @@ def get_track_fusion_config(path: str | Path | None = None) -> dict[str, Any]:
         "self_position_std_m": _read_vector3(
             fusion_config.get("self_position_std_m"),
             name="track_fusion.self_position_std_m",
-            default=[1.0, 1.0, 0.5],
+            default=[0.0, 0.0, 0.0],
         ),
         "min_confidence": float(fusion_config.get("min_confidence", 0.1)),
         "mahalanobis_distance_threshold": float(

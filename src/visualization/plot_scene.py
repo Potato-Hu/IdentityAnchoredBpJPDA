@@ -157,6 +157,11 @@ def _enemy_trajectory_color(role: str) -> str:
     return _COLORS["key_trajectory"] if role == "key" else _COLORS["non_key_trajectory"]
 
 
+def _key_display_labels_by_enemy_index(scene: ScenarioGroundTruth) -> dict[int, str]:
+    key_indices = [idx for idx, node in enumerate(scene.enemy_nodes) if node.role == "key"]
+    return {enemy_idx: f"K{key_idx + 1}" for key_idx, enemy_idx in enumerate(key_indices)}
+
+
 def plot_scene_snapshot(
     scene: ScenarioGroundTruth,
     trajectories: TrajectoryBundle,
@@ -187,15 +192,16 @@ def plot_scene_snapshot(
     friendly_coords = trajectories.friendly_positions[timestep]
     ax.scatter(friendly_coords[:, 0], friendly_coords[:, 1], friendly_coords[:, 2], c=_COLORS["friendly_entity"], marker=_MARKERS["friendly"], s=_MARKER_SIZES["snapshot"], depthshade=False)
 
+    key_display_labels = _key_display_labels_by_enemy_index(scene)
     for idx, node in enumerate(scene.enemy_nodes):
         if node.role != "key":
             continue
         coord = trajectories.enemy_positions[timestep, idx]
-        _annotate_entity(ax, coord, f"E{idx + 1}", _enemy_entity_color(node.role), scene.bounds)
+        _annotate_entity(ax, coord, key_display_labels[idx], _enemy_entity_color(node.role), scene.bounds)
 
     for idx in range(len(scene.friendly_uavs)):
         coord = trajectories.friendly_positions[timestep, idx]
-        _annotate_entity(ax, coord, f"F{idx + 1}", _COLORS["friendly_entity"], scene.bounds)
+        _annotate_entity(ax, coord, f"U{idx + 1}", _COLORS["friendly_entity"], scene.bounds)
 
     _style_3d_axes(ax, scene.bounds)
     ax.legend(
@@ -238,6 +244,7 @@ def plot_trajectories_until_timestep(
     ax = fig.add_subplot(111, projection="3d")
     end = timestep + 1
     label_slot = 0
+    key_display_labels = _key_display_labels_by_enemy_index(scene)
 
     if target in {"all", "enemy"}:
         for idx, node in enumerate(scene.enemy_nodes):
@@ -267,7 +274,7 @@ def plot_trajectories_until_timestep(
                 _annotate_entity(
                     ax,
                     coords[-1],
-                    f"E{idx + 1}",
+                    key_display_labels[idx],
                     entity_color,
                     scene.bounds,
                     offset_slot=label_slot,
@@ -290,7 +297,7 @@ def plot_trajectories_until_timestep(
             _annotate_entity(
                 ax,
                 coords[-1],
-                f"F{idx + 1}",
+                f"U{idx + 1}",
                 _COLORS["friendly_entity"],
                 scene.bounds,
                 offset_slot=label_slot,
@@ -376,7 +383,7 @@ def plot_key_enemy_interference_curves(
     the other key targets on a shared linear axis.
     """
 
-    key_labels = [f"E{idx + 1}" for idx, node in enumerate(scene.enemy_nodes) if node.role == "key"]
+    key_labels = list(_key_display_labels_by_enemy_index(scene).values())
     powers_watts = np.asarray(trajectories.key_enemy_interference_watts, dtype=float)
     powers_dbm = np.asarray(trajectories.key_enemy_interference_dbm, dtype=float)
     powers = powers_dbm if scale == "dbm" else powers_watts
@@ -439,7 +446,7 @@ def plot_key_enemy_nearest_friendly_distance_curves(
     """Plot all key-enemy nearest-friendly distance curves in one figure."""
 
     key_indices = [idx for idx, node in enumerate(scene.enemy_nodes) if node.role == "key"]
-    key_labels = [f"E{idx + 1}" for idx in key_indices]
+    key_labels = list(_key_display_labels_by_enemy_index(scene).values())
     if not key_indices:
         return []
 
