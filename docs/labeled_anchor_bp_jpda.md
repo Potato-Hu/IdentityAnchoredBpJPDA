@@ -54,8 +54,10 @@ The edge cases implemented by `_bp_jpda_predict_track_state` are:
 
 - no previous state + valid prior: initialize the recursive state from the prior;
 - previous state + missing prior: use motion prediction only;
-- no previous state + missing prior: mark the track inactive in the BP context;
+- no previous state + missing prior: keep the label uninitialized and inactive; the missing-report placeholder is not saved as a recursive state or exported as a valid fallback;
 - expired previous state: treat it as absent.
+
+Initialization is distinct from local sensing-range activity. A valid first report establishes the track directly, even outside local sensing range. Once established, the recursive state can survive temporary missing reports until the missed-step limit; a missing report alone cannot create or revive a track.
 
 ### 4.1 Covariance-Aware Fusion
 

@@ -144,6 +144,13 @@ python -m src.runner.run_nonkey_density_sweep \
 
 该实验固定使用 `labeled_anchor_bp_jpda`。总运行次数等于“种子数 × 比例数”，大规模参数会耗时较长。
 
+实验结束后，在同一输出目录生成 GOSPA、IDSW 两张独立图，以及双纵轴合并图 `nonkey_density_gospa_idsw_combined.pdf`。合并图用左轴蓝色实线表示 GOSPA，右轴橙色虚线表示 IDSW。
+也可以直接从已保存的逐次实验 CSV 重新生成三张图：
+
+```bash
+python -m src.runner.run_nonkey_density_sweep --plot-only --csv-path <nonkey_density_run_metrics.csv>
+```
+
 ## 配置说明
 
 ### 全局与环境配置

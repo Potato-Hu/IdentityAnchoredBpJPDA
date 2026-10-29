@@ -144,6 +144,13 @@ python -m src.runner.run_nonkey_density_sweep \
 
 This experiment always uses `labeled_anchor_bp_jpda`. The total number of runs is the number of seeds multiplied by the number of ratios, so large experiments may take a while.
 
+Each completed sweep generates separate GOSPA and IDSW figures plus `nonkey_density_gospa_idsw_combined.pdf` in the same output directory. The combined figure uses a solid blue GOSPA curve on the left axis and a dashed orange IDSW curve on the right axis.
+Regenerate all three figures directly from the saved run-level CSV with:
+
+```bash
+python -m src.runner.run_nonkey_density_sweep --plot-only --csv-path <nonkey_density_run_metrics.csv>
+```
+
 ## Configuration
 
 ### Global and environment configuration

@@ -1,0 +1,894 @@
+
+========== PAGE 1 ==========
+Identity-Anchored BP-JPDA for Multi-UA V
+Key-Target Tracking
+Jiaxi Hu 1, Yan Zhang 1∗, Hongjia Li 1, Guangxi Yu 1, Weiping Wang1
+1 Institute of Information Engineering, Chinese Academy of Sciences
+Beijing, China
+{hujiaxi, zhangyan, lihongjia, yuguangxi,wangweiping}@iie.ac.cn
+Abstract—This paper addresses multi-UA V tracking of a small
+set of key targets in the presence of numerous non-key targets and
+false alarms. Identity-bearing surveillance reports are intermit-
+tent and inaccurate, whereas high-rate onboard measurements
+are more precise but anonymous. We propose an uncertainty-
+aware identity-anchored belief-propagation joint probabilistic
+data association (IA-BP-JPDA) method to resolve the resulting
+association ambiguity. For each key target, a covariance-aware
+anchor combines the recursive prediction with the latest same-
+identity surveillance report to guide association of anonymous
+onboard measurements, while a bounded fallback maintains
+short-term track continuity during measurement loss. IA-BP-
+JPDA is training-free and requires no target-specific motion
+data. Evaluation over 100 paired Monte Carlo runs shows
+improved tracking accuracy and identity continuity over rep-
+resentative MTT baselines, with better tracks also improving
+closed-loop defender pursuit. IA-BP-JPDA reduces the time-
+averaged GOSPA by51.6%over a BP-based JPDA baseline,
+while ablation results support the contributions of the proposed
+measurement-association and anchor-management mechanisms.
+Index Terms—Multi-UA V tracking, multi-target tracking, data
+association, belief propagation, heterogeneous sensing.
+I. INTRODUCTION
+Unmanned aerial vehicle (UA V) swarms provide high mo-
+bility and rapid deployment for sensing and monitoring appli-
+cations, while unauthorized UA Vs also pose increasing risks
+to critical infrastructures. A practical counter-UA V architecture
+combines wide-area surveillance with mobile defender UA Vs:
+an upstream system detects and identifies targets, while de-
+fender UA Vs approach selected targets for close-range sensing
+and continuous tracking [1], [2]. Because defender resources
+are limited, maintaining close-range tracks for every observed
+UA V is generally infeasible in dense scenarios.
+Motivated by threat-aware sensing and resource allocation
+[3], [4], we consider an upstream surveillance system that
+designates a small subset of UA Vs as key targets based
+on threat assessment. It provides identity-bearing state re-
+ports with relatively large uncertainty, whereas defender-UA V
+onboard sensors provide more accurate and frequent but
+anonymous measurements. Each onboard measurement may
+therefore originate from a key target, a non-key target, or
+a false alarm. This creates a data-association problem for
+multi-target tracking (MTT), where the tracker must estimate
+the states of multiple targets while also resolving the unknown
+correspondence between measurements and targets.
+Belief propagation (BP) provides an efficient approximation
+to marginal target–measurement association probabilities and
+has been widely used for scalable multi-target tracking [5]–[7].
+These marginals can be incorporated into a joint probabilistic
+data association (JPDA) update. In this work, we refer to this
+BP-based JPDA implementation as BP-JPDA. However, when
+a few key targets are surrounded by many kinematically simi-
+lar non-key targets, competing anonymous measurements can
+receive comparable association probabilities. A high-weight
+non-key measurement may then pull a key-target posterior
+toward a distractor, biasing the next prediction and causing
+recursive identity errors [6]. In a mobile sensing loop, such
+errors additionally misguide defender motion and degrade
+subsequent sensing geometry.
+To address this problem, we propose an uncertainty-aware
+identity-anchored BP-JPDA framework, termed IA-BP-JPDA.
+It combines each key track’s recursive motion prediction
+with the latest available surveillance report to construct an
+uncertainty-aware anchor for associating high-rate anonymous
+onboard measurements. The anchor reinforces task identity
+under ambiguous associations and supports short-term track
+continuity when reliable onboard measurement support is
+unavailable. Rather than treating data association as an isolated
+task, we consider a closed-loop cooperative tracking system.
+The source code and configurations used in our evaluation are
+available in an anonymized repository. 1
+Our main contributions are summarized as follows:
+•We formulate a closed-loop cooperative key-target track-
+ing problem that combines intermittent identity-bearing
+surveillance reports with high-rate anonymous onboard
+measurements in dense non-key-target interference.
+•We propose a training-free IA-BP-JPDA method, which
+employs a covariance-aware identity anchor to guide
+BP-based measurement association and incorporates a
+bounded fallback to handle temporary measurement loss.
+•Experiments over paired Monte Carlo runs demon-
+strate improved tracking accuracy, identity continuity, and
+closed-loop pursuit over representative MTT baselines,
+while ablation results verify the proposed association and
+anchor-management mechanisms.
+1https://anonymous.4open.science/status/IdentityAnchoredBpJPDA
+
+========== PAGE 2 ==========
+II. RELATEDWORK
+A. Cooperative Multi-UAV Search and Tracking
+Cooperative UA V search and tracking has been studied
+from both learning-based and model-based perspectives. Xia et
+al. [8] developed a MARL-based scheme for energy-efficient
+cooperative target tracking using target-position information
+from detection sensors, while the sensing process itself is
+not explicitly modeled. In [9], multiple pursuer UA Vs learn
+cooperative search-and-tracking policies under a predefined
+linear constant-speed target-motion pattern. Such learning-
+based approaches optimize cooperative mobility effectively but
+depend on representative training dynamics, which may be
+unavailable for unknown or adversarial UA V behavior. Zhang
+et al. [10] jointly considered multi-UA V area coverage, in-
+formation fusion, task assignment, and target-tracking control,
+demonstrating how estimated target states can support model-
+based cooperative mobility.
+These studies mainly focus on UA V coordination and con-
+trol once usable target information is available. Our work
+instead addresses the preceding association problem: main-
+taining task-designated key-target tracks from anonymous on-
+board measurements amid numerous non-key targets and false
+alarms. In the closed loop, association errors can propagate
+through fusion and assignment to defender motion, thereby
+degrading subsequent sensing geometry.
+B. BP-Based Data Association and Prior-Assisted Multi-
+Target Tracking
+Data association is a central challenge in multi-target track-
+ing under missed detections, false alarms, and competing
+measurements. BP methods provide efficient approximations
+to marginal target–measurement association probabilities and
+are attractive for scalable MTT. Recent studies have improved
+BP-based tracking from different perspectives: Kropfreiter
+et al. [11] analyzed track coalescence and repulsion in BP,
+JPDA, and MHT; Sun et al. [12] combined adaptive kernel
+Kalman filtering with BP for maneuvering targets under clut-
+ter; and [13] jointly estimated target states, nonuniform clut-
+ter, and associations through robust message passing. These
+approaches improve association inference, state estimation,
+or clutter modeling from anonymous measurements, but do
+not provide an external task-level identity source when key
+and non-key targets exhibit similar kinematics. A locally
+plausible association may therefore still correspond to the
+wrong mission-designated target and recursively bias subse-
+quent predictions.
+Persistent labels provide another mechanism for maintaining
+track continuity. Label-aware random-finite-set filters, includ-
+ing the labeled multi-Bernoulli (LMB) filter [14] and theδ-
+generalized labeled multi-Bernoulli (δ-GLMB) filter [15], at-
+tach distinct labels to target states and support temporally con-
+sistent trajectory estimation. Theδ-GLMB explicitly maintains
+label-conditioned association-history hypotheses, whereas the
+LMB provides a lower-complexity approximation. However,
+persistent labels do not eliminate measurement-to-track ambi-
+guity: when key and non-key targets have similar kinematics
+and measurements are anonymous, incorrect associations can
+still cause a labeled track to drift toward the wrong physical
+target. This challenge is further aggravated in our setting by
+intermittent and inaccurate surveillance reports and dense non-
+key-target interference.
+Complementary information has also been incorporated into
+probabilistic association. Bai et al. [16] extracted range–
+Doppler spectral features to estimate whether radar detections
+were target- or clutter-generated and fused the resulting classi-
+fication beliefs with kinematic beliefs obtained through factor-
+graph inference, improving clutter suppression and association
+robustness. More closely related to our work, Gaglione et
+al. [17] fused anonymous sensor measurements with target-
+provided reports carrying both state and identity information in
+a unified factor graph. Their sum-product formulation accounts
+for missed detections, false alarms, association uncertainty,
+and asynchronous observations. Our problem similarly com-
+bines identity-bearing and anonymous sensing information, but
+considers a different multi-UA V key-target tracking setting.
+The surveillance system provides intermittent and inaccu-
+rate reports only for task-designated key targets, while each
+defender UA V receives high-rate anonymous measurements
+contaminated by numerous non-key targets and false alarms.
+We therefore focus on maintaining reliable key-target identi-
+ties under persistent measurement-association ambiguity using
+identity-anchored BP-JPDA.
+III. SYSTEMMODEL ANDPROBLEMFORMULATION
+A. Mobility Model
+LetKandNdenote the key- and non-key-target index sets,
+respectively, and letI=K ∪ N. At time stepn, for target
+i∈ I, the 6D state is
+xi,n =
+
+pTi,n,v Ti,nT .(1)
+Targets move at constant speedv T with headingψ i,n and
+pitchϑ i,n governed by first-order Gauss–Markov processes,
+and their positions evolve as
+pi,n+1 =p i,n + ∆tv i,n.(2)
+To create persistent association ambiguity, each non-key
+target is associated with a nearby key target through a mapping
+κ:N → K. Its initial heading and pitch are defined as
+ψj,0 =ψ κ(j),0 +η ψj ,
+ϑj,0 =ϑ κ(j),0 +η ϑj , j∈ N, (3)
+whereη ψj andη ϑj denote independent zero-mean Gaussian
+heading and pitch perturbations, respectively. The physical
+target dynamics are unknown to the trackers. Instead, the track-
+ers employ an interacting multiple-model (IMM) predictor for
+recursive state prediction, as detailed in Section IV-B.
+LetUdenote the defender-UA V set. Each defender UA V has
+states u,n = [p Tu,n,v Tu,n]T, which is assumed known to both
+the onboard tracker and the centralized processor. To close
+the perception–control loop without introducing a separate
+
+========== PAGE 3 ==========
+trajectory-optimization problem, the UA V selects a motion
+directiond u,n ∈ Dfrom the discrete set
+D≜{0} ∪
+ d
+∥d∥2
+:d∈ {−1,0,1} 3,d̸=0
+
+,|D|= 27.
+Here,d u,n =0represents hovering. The state of the defender
+UA V with speedv U is then updated as
+vu,n =v Udu,n,p u,n+1 =p u,n + ∆tv u,n.(4)
+B. Identity-Bearing Surveillance Reports
+An external surveillance system provides intermittent state
+reports for key targets with fixed task-level identities. Letq
+index the scheduled surveillance-report epochs andn q denote
+the system time step at which theqth report is sampled. The
+surveillance report set is defined as
+Gq ≜
+ 
+i,y Si,q 	i∈K ,(5)
+whereidenotes the fixed task-level identity of the correspond-
+ing key target, andy Si,q is the reported state measurement. For
+key targeti∈ Kat report epochq,
+ySi,q =x i,nq +b Sq +ε Si,q,ε Si,q ∼ N(0,RS),(6)
+whereb Sq is a slowly varying common bias. Each scheduled
+report is independently missing with probabilityP SM and is de-
+livered after a nonnegative random latencyτ q = max{0,eτq},
+witheτq ∼ N(µτ , σ2τ ). The identity slots remain fixed when
+individual reports are unavailable.
+C. Anonymous Onboard Measurements
+At every time step, UA Vureceives an anonymous measure-
+ment setZ u,n ={z u,m,n}Mu,nm=1 , whereM u,n is the number
+of measurements received by UA Vuandmindexes the
+individual measurements. For a detected targetiwithin sensing
+radiusR D,
+zu,m,n =
+
+pi,n −p u,n
+vi,n −v u,n
+
++ν u,m,n,ν u,m,n ∼ N(0,RO).
+(7)
+The detection probability decreases with sensing range and
+local target density:
+PD,u,i,n =P rD(du,i,n) exp(−αDξu,i,n),(8)
+whered u,i,n =∥p i,n −p u,n∥2,ξ u,i,n ∈[0,1]denotes
+the normalized local target density, andα D ≥0controls
+the corresponding density-dependent degradation. The range-
+dependent termP rD(·)decreases fromP HD toP ED over the
+sensing range.
+False alarms followC u,n ∼Poisson(λ C∆t)and include
+both uniform background and target-proximal components. All
+detections and false alarms enter the tracker without target
+identity; hence a measurementz u,m,n may originate from a
+key target, a non-key target, or clutter. Its unknown origin must
+therefore be resolved through data association.
+D. Problem Formulation
+LetY n collect all surveillance reports and onboard mea-
+surements available up to time stepn. For UA Vuand key
+targeti, define
+au,i,n ∈ {0,1, . . . , Mu,n},
+wherea u,i,n =massociates onboard measurementmwith
+identityi, anda u,i,n = 0denotes no associated onboard
+measurement. Each measurement can be associated with at
+most one key target.
+The tracking problem is to infer
+p({xi,n}i∈K,{a u,i,n}u,i | Yn),(9)
+while preserving task-level key-target identities. The resulting
+state estimates are subsequently fused across UA Vs and used to
+guide defender mobility, thereby coupling association quality
+with future sensing geometry.
+IV. IDENTITY-ANCHOREDBP-JPDAFORMULTI-UAV
+KEY-TARGETTRACKING
+A. Closed-Loop Processing Overview
+Unlike learning-based approaches that require offline pol-
+icy training under predefined target-motion scenarios, IA-BP-
+JPDA requires neither scenario-specific training trajectories
+nor learned policy parameters. Instead, it operates recursively
+using two online sensing streams: identity-bearing surveillance
+reports and anonymous onboard measurements. As illustrated
+in Fig. 1, IA-BP-JPDA operates in a closed sensing–tracking–
+control loop. At each time stepn, the sensing layer provides
+the anonymous onboard measurement sets{Z u,n}u∈U and the
+identity-bearing surveillance reportsG q available at that time.
+Each defender UA V processes both information streams using
+IA-BP-JPDA to estimate its key-target tracks. The resulting
+fused tracks are used for target assignment and UA V control,
+after which the system advances ton+ 1with new sensing
+and the loop continues.
+B. Per-UAV IA-BP-JPDA Tracker
+For defender UA Vu∈ Uand key-target identityi∈ K, the
+per-UA V tracker estimates the UA V-relative target state
+ζu,i,n ≜x i,n −s u,n =
+pi,n −p u,n
+vi,n −v u,n
+
+.(10)
+The latent stateζ u,i,n is not directly observed and is inferred
+recursively from the information historyY u,n. Throughout
+this section, the superscripts−,anc, and+denote the IMM
+prediction, the identity-anchored prediction, and the per-UA V
+posterior returned after the BP-JPDA update or anchor fall-
+back, respectively. The superscriptSdenotes a time-aligned
+surveillance-report estimate and its covariance expressed in
+the UA V-relative coordinate frame.
+The per-UA V recursion is initialized when the first valid
+time-aligned surveillance report for identityibecomes avail-
+able. In the absence of a preceding posterior, the report-derived
+relative state initializes the identity anchor as
+
+bζancu,i,n0i ,P ancu,i,n0i  = bζSu,i,n0i ,P Su,i,n0i  ,(11)
+
+========== PAGE 4 ==========
+Sensing
+Per-UAV IA-BP-JPDA Tracker (Proposed Method)
+Centralized Fusion, Assignment and Control
+Environment
+Onboard Measurements
+𝓩𝒖,𝒏 𝒖∈𝓤 , 𝓩𝒖,𝒏 = 𝒛𝒖,𝒎,𝒏 𝒎=𝟏
+𝑴𝒖,𝒏
+( anonymous, high-rate )
+Surveillance Reports
+𝒢𝑞 = 𝑖, 𝐲𝑖,𝑞S 𝑖∈𝒦
+( identity-bearing, lagged, low-rate )
+at time step 𝑛
+: Defender UAV
+: Key target
+: Non-key target
+: Sensing range
+UAV
+UAV 𝑢
+1
+…
+IMM Motion
+Prediction
+Identity-Anchor 
+Construction 
+Anchor-Guided
+BP Association
+IMM Motion 
+Prediction
+෠𝜻1,𝑖,𝑛− , 𝐏1,𝑖,𝑛−
+Identity-Anchor 
+Construction
+෠𝜻1,𝑖,𝑛anc , 𝐏1,𝑖,𝑛anc
+Anchor-Guided
+BP Association
+𝜷1,𝑖,𝑛 = 𝛽1,𝑖,𝑚,𝑛 𝑚=0
+𝑀1,𝑛
+JPDA Posterior Update 
+/ Anchor Fallback
+෠𝜻1,𝑖,𝑛+ , 𝐏1,𝑖,𝑛+
+JPDA Posterior Update 
+/ Anchor Fallback
+෠𝒯1,𝑛L
+෠𝒯𝑢,𝑛L
+෠𝜻1,𝑖,𝑛−1+ , 𝐏1,𝑖,𝑛−1+
+෠𝜻𝑢,𝑖,𝑛−1+ , 𝐏𝑢,𝑖,𝑛−1+
+Multi-UAV Track Fusion Key Targets Assignment Defender UAV Control
+Target
+UAV
+෠𝒯𝑢,𝑛L 𝑢∈𝒰 ෠𝒯𝑛F
+propagate 
+system to 
+time step 𝑛 + 1 ෠𝒯𝑛F, Π𝑛 𝑑𝑢,𝑛
+…
+…1 2 𝒦
+简化版用图
+Fig. 1: Closed-loop processing framework of IA-BP-JPDA for multi-UA V key-target tracking.
+wheren 0i is the initialization time. This initialized anchor is
+then processed using the current onboard measurement set
+through the BP-JPDA update or, when measurement support
+is unavailable, the bounded anchor fallback. The resulting
+posterior( bζ+u,i,n0i ,P +u,i,n0i )is retained for subsequent IMMprediction.
+1) IMM Motion Prediction:For UA Vuand key-target
+identityi, the tracker maintains the relative state
+ζu,i,n =x i,n −s u,n.
+An established track is propagated using an IMM bank
+H={CV,CA,CT L,CT R}. For modelh∈ H, let bχ(h)−u,i,n,
+P(h)−χ,u,i,n, andµ (h)−u,i,n denote the predicted model-conditioned
+state, covariance, and model probability, respectively, and let
+Jmap the internal IMM state to the 6D UA V-relative tracking
+state. The standard IMM interaction and prediction steps are
+summarized as
+
+bζ−u,i,n,P −u,i,n = IMM-Predict bζ+u,i,n−1,P +u,i,n−1 .
+(12)
+The standard IMM recursion (see [18]) is omitted here.
+2) Uncertainty-Aware Identity-Anchor Construction:IMM
+prediction uses associated onboard measurements; however,
+dense sensing may cause misassociation that diverts the track.
+These errors propagate through fusion and task assignment to
+UA V motion, degrading the sensing geometry. When a valid
+time-aligned surveillance estimate( bζSu,i,n,P Su,i,n)is available,
+it corrects the IMM prediction of the same task identity.
+For each IMM branchh∈ H, the surveillance-report
+innovation covariance and the corresponding identity-anchor
+gain are
+SS,(h)u,i,n =JP (h)−χ,u,i,nJT +P Su,i,n,
+KS,(h)u,i,n =P (h)−χ,u,i,nJT
+
+SS,(h)u,i,n
+−1
+,
+(13)
+whereJprojects the internal IMM state onto the 6D UA V-
+relative tracking state. The surveillance report then corrects
+the model-conditioned prediction as
+bχ(h),ancu,i,n = bχ(h)−u,i,n +K S,(h)u,i,n
+
+bζSu,i,n −J bχ(h)−u,i,n ,
+P(h),ancχ,u,i,n = I−K S,(h)u,i,nJ P(h)−χ,u,i,n I−K S,(h)u,i,nJT
++K S,(h)u,i,nPSu,i,n
+
+KS,(h)u,i,n
+T
+.
+(14)
+The report update leaves the predicted model probabilities
+µ(h)−u,i,n unchanged. The identity-anchored prediction is obtained
+by combining the corrected branches using:
+bζancu,i,n = X
+h∈H
+µ(h)−u,i,nJbχ(h),ancu,i,n ,
+Pancu,i,n = X
+h∈H
+µ(h)−u,i,n
+h
+JP(h),ancχ,u,i,n JT +∆ (h)u,i,n ∆(h)u,i,nTi,
+(15)
+where∆ (h)u,i,n ≜J bχ(h),ancu,i,n − bζancu,i,n is the deviation of the
+anchored mean of modelhfrom the combined identity-
+anchored mean.
+Unlike directly replacing the IMM prediction with the
+surveillance report or combining the two using a fixed coeffi-
+
+========== PAGE 5 ==========
+cient, the proposed construction preserves the temporal infor-
+mation accumulated by the recursive IMM tracker and adapts
+the contribution of each input according to its covariance. The
+resulting identity-anchored prediction is then applied to set the
+gating and likelihoods for the BP-JPDA update.
+If no valid surveillance report is available, the identity-
+anchored prediction reduces to the IMM prediction:
+
+bζancu,i,n,P ancu,i,n = bζ−u,i,n,P −u,i,n .(16)
+3) Anchor-Guided BP Association:The BP association
+stage approximates the association marginals through sum-
+product message passing on a bipartite target–measurement
+graph. Only key-target identitiesi∈ Kare instantiated
+as target nodes, while non-key-target measurements remain
+anonymous distractors competing with key-target measure-
+ments. We retain the standard BP recursion but construct the
+validation gates and edge potentials from the identity-anchored
+prediction.
+For target identityiand onboard measurementm, the
+anchor-conditioned measurement innovation and its covariance
+are given by
+rOu,i,m,n =z u,m,n − bζancu,i,n,
+SOu,i,n =P ancu,i,n +R O. (17)
+A measurementmis validated for targetiif
+(rOu,i,m,n)T(SOu,i,n)−1rOu,i,m,n ≤Γ G,(18)
+whereΓ G is the95th percentile of theχ 2 distribution with six
+degrees of freedom.
+The validation setM Gu,i,n contains all measurements sat-
+isfying the gate condition in (18). For each validated target–
+measurement pairm∈ M Gu,i,n, the corresponding BP edge
+potential is defined as
+φu,i,m,n =
+bPD,u,i,n
+(1− bPD,u,i,n)Λ0u,n
+× N
+
+zu,m,n; bζancu,i,n,S Ou,i,n .
+(19)
+For pairs outside the validation gate,φ u,i,m,n = 0. Here,
+bPD,u,i,n denotes the detection probability evaluated from
+the identity-anchored prediction, andΛ 0u,n is the false-alarm
+measurement intensity constructed fromλ C over the onboard
+measurement domain.
+Standard BP-JPDA message passing [6] then yields
+βu,i,m,n ≈Pr (a u,i,n =m| Yu,n), m= 0, . . . , Mu,n,
+whereY u,n ⊆ Yn is the surveillance reports and onboard
+measurements available to UA Vuup to time stepn.
+4) JPDA Posterior Update and Bounded Anchor Fallback:
+Form∈ {1, . . . , Mu,n}, let
+ bζ+u,i,m,n,P +u,i,m,n denote the
+posterior conditioned ona u,i,n =m, obtained by Kalman
+correction of the anchored IMM branches followed by IMM
+recombination. Form= 0, this component is the anchored
+prediction, i.e.,
+
+bζ+u,i,0,n,P +u,i,0,n = bζancu,i,n,P ancu,i,n .
+The JPDA posterior mean is
+bζ+u,i,n =
+Mu,nX
+m=0
+βu,i,m,nbζ+u,i,m,n,(20)
+andP +u,i,n is obtained by the corresponding Gaussian-
+mixture second-moment matching. Define the total onboard-
+measurement support as
+ρu,i,n ≜
+Mu,nX
+m=1
+βu,i,m,n = 1−β u,i,0,n.(21)
+Whenρ u,i,n = 0, the posterior reduces to the identity anchor:
+bζ+u,i,n,P +u,i,n = bζancu,i,n,P ancu,i,n .(22)
+If neither a valid surveillance report nor onboard measurement
+support is available, the anchored prediction is retained for at
+mostB F consecutive steps before track invalidation.
+The valid identity-indexed posteriors maintained by UA Vu
+are collectively denoted by bT Lu,n ≜ ni, bζ+u,i,n,P +u,i,noi∈K .
+C. Centralized Fusion, Assignment and Control
+At each time step, the valid identity-indexed tracks produced
+by the defender UA Vs are transformed to a common reference
+frame, centrally fused, and subsequently used for UA V–target
+assignment and motion control. Since the defender-UA V state
+su,n is assumed known, a valid local track of identityifrom
+UA Vuis transformed as
+xu,i,n =s u,n + bζ+u,i,n, Pu,i,n =P +u,i,n.
+For each identity, mutually inconsistent estimates are first
+rejected using a Mahalanobis-distance gate. Since the re-
+maining local tracks may share surveillance information and
+thus have unknown cross-correlations, they are fused using
+covariance intersection (CI) [19]:
+ bxFi,n,P Fi,n = CI  xu,i,n, Pu,i,n	u∈U Ai,n  ,(23)
+whereU Ai,n contains the UA Vs whose estimates pass the con-
+sistency gate. The standard CI recursion and weight selection
+are omitted. The resulting identity-indexed fused tracks are
+collectively denoted by bT Fn .
+The fused key-target tracks are assigned to defender UA Vs
+using a minimum-cost one-to-one assignment based on the
+one-step predicted UA V–target separation [20]; any remaining
+UA V is assigned to its nearest available fused track.
+For UA Vuassigned to identityi ⋆u,n, the motion direction
+is selected fromDto maximize its alignment with the fused
+target position:
+du,n = arg max
+d∈D
+dT bpFi⋆u,n,n −p u,nbpFi⋆u,n,n −p u,n2 .(24)
+For an unassigned UA V , an invalid assigned track, or a
+negligible UA V–target displacement,d u,n =0. Applying
+these actions through (4) updates the defender-UA V states
+and sensing geometry at time stepn+ 1, thereby closing the
+sensing–tracking–assignment–control loop.
+
+========== PAGE 6 ==========
+V. SIMULATIONRESULTS ANDANALYSIS
+A. Experiment Setup
+We simulate 5 defender UA Vs, 3 key targets, and 30 non-key
+targets in a200×200×20 m 3 ROI for30 swith∆t= 0.5 s.
+All targets follow the 3D Gauss–Markov mobility model at
+vT = 4 m/s. Non-key targets are initialized with headings
+and pitches close to those of nearby key targets (with small
+random perturbations of about0.02rad and0.01rad, respec-
+tively), while their subsequent motion evolves independently.
+The Gauss–Markov heading and pitch innovation standard
+deviations are0.5and0.2rad, respectively.
+The defender UA V speed is set tov U = 5 m/sand have
+a70 monboard sensing range. The onboard position and
+velocity measurement standard deviations are[2,2,0.4] mand
+[1,1,0.2] m/s. Detection probability decreases from0.95at
+short range to0.50near the sensing boundary and further
+degrades with local target density. The false-alarm rate is
+1 s −1, with half of the false alarms generated near visible
+targets.
+Identity-bearing surveillance reports are generated every1 s
+with5%missing probability. The delivery latency parameters
+areµ τ = 0.5 sandσ τ = 0.25 s. The surveillance-report
+position and velocity standard deviations are[10,10,2] mand
+[4,4,0.4] m/s, respectively, with slowly varying common bias.
+For IA-BP-JPDA, the 95% validation gate givesΓ G =
+12.59. BP uses at most 30 iterations with tolerance10 −3, and
+BF = 5.
+B. Baselines and Evaluation Metrics
+We compare the proposed IA-BP-JPDA with four represen-
+tative MTT baselines. All methods use the same sensor outputs
+and motion models and differ only in how the identity-bearing
+surveillance reports and anonymous onboard measurements
+are processed. The four baselines are detailed as follows.
+1) BP-based JPDA (BP-JPDA) [6]:The surveillance reports
+initialize or reinitialize key-target tracks; once initialized,
+the tracks are recursively predicted and updated using the
+anonymous onboard measurements.
+2) GM-PHD [21]:The surveillance reports generate birth
+components and associate the extracted components with key-
+target identities. The anonymous onboard measurements con-
+stitute the measurement set for the recursive GM-PHD update.
+3)δ-GLMB [15]:The surveillance reports provide labeled
+track priors, while onboard measurements are used to recur-
+sively update the joint hypotheses and target states.
+4) LMB [14]:The LMB filter is a computationally efficient
+approximation of theδ-GLMB that assumes independence
+among Bernoulli components, using the same surveillance
+reports and onboard measurements but with lower complexity.
+Performance is evaluated using three complementary met-
+rics covering set-level tracking accuracy, identity consistency,
+and closed-loop target pursuit. All methods use identical
+sensing realizations, fusion, assignment, and control, and
+are evaluated over 100 paired Monte Carlo runs. We report
+GOSPA [22] withp= 2,α= 2, andc= 50 m, the number of
+identity switches (IDSW), and the mean nearest-UA V distance
+dKU,n = 1|K| Xi∈K minu∈U ∥pu,n −p i,n∥2 .(25)
+C. Closed-Loop Performance Comparison
+Fig. 2 shows a closed-loop rollout of IA-BP-JPDA config-
+ured as described in Section V-A. Despite non-key targets,
+imperfect reports, and false alarms, IA-BP-JPDA preserves
+continuous key-target tracking and guides the defender UA Vs
+toward their assigned targets.
+0
+50
+100
+150
+200
+X (m)
+0
+50
+100
+150
+200
+Y (m)
+0
+10
+20
+Z (m)
+Key target
+Non-key target
+Defender UAV
+Key target trajectory
+Non-key target trajectory
+Defender trajectory
+K1
+K2
+K3
+U1
+U2 U3U4
+U5
+Fig. 2: Representative closed-loop rollout of IA-BP-JPDA.
+We next compare all methods in terms of set-level tracking
+accuracy and closed-loop pursuit performance. Fig. 3 shows
+the mean GOSPA over 100 Monte Carlo runs, with shaded
+regions indicating pointwise 95% confidence intervals. After
+the initial transient, IA-BP-JPDA achieves substantially lower
+GOSPA than all baselines. Att= 30 s, its mean GOSPA
+is9.48 m, compared with50.77 mfor LMB and51.76 m
+for BP-JPDA. Its95%confidence interval separates from
+those of the baselines after approximately6 s, indicating a
+consistent improvement in key-target tracking accuracy. The
+0 5 10 15 20 25 30
+Time (s)
+20
+40
+60
+80GOSPA distance (m)
+BP-JPDA
+GM-PHD
+LMB
+δ-GLMB
+IA-BP-JPDA
+Fig. 3: GOSPA comparison of IA-BP-JPDA and the baseline
+methods.
+improved tracking estimates subsequently translate into better
+
+========== PAGE 7 ==========
+0 5 10 15 20 25 30
+Time (s)
+10
+20
+30
+40
+50
+60
+70Mean nearest-UAV distance (m)
+BP-JPDA
+GM-PHD
+LMB
+δ-GLMB
+IA-BP-JPDA
+Fig. 4: Nearest-UA V-distance performance of the compared
+tracking methods.
+physical pursuit. As shown in Fig. 4, IA-BP-JPDA achieves
+the smallest mean nearest-UA V distance from approximately
+t= 9 sonward, reaching8.46 matt= 30 scompared with
+28.29 mfor BP-JPDA. The delayed improvement relative to
+GOSPA reflects the physical response time between improved
+estimation and UA V motion.
+Table I summarizes the time-averaged tracking perfor-
+mance and computational cost. IA-BP-JPDA reduces the mean
+GOSPA by51.6%relative to BP-JPDA and achieves the lowest
+IDSW among all methods. Its runtime of44.83 ms/step
+remains well below the0.5 ssampling interval.
+TABLE I: Time-averaged Results Over 100 Monte Carlo Runs
+Method mean GOSPA (m) ID switches Runtime (ms/step)
+BP-JPDA 42.52 19.8126.16
+GM-PHD 59.92 45.63 150.65
+LMB 60.04 16.18 30.00
+δ-GLMB 60.07 15.90 322.89
+IA-BP-JPDA 20.56 11.6644.83
+We further evaluate the robustness of IA-BP-JPDA to
+increasing non-key-target interference. The number of key
+targets is fixed at|K|= 3, while|N | ∈ {9,12, . . . ,60},
+corresponding toρ N/K =|N |/|K| ∈ {3,4, . . . ,20}. The
+nominal setting above hasρ N/K = 10. All other scenario and
+sensing parameters remain unchanged, and 100 Monte Carlo
+runs are conducted at each ratio.
+As shown in Fig. 5, both GOSPA and IDSW generally
+increase withρ N/K, reflecting the greater association ambi-
+guity introduced by additional anonymous distractors. At the
+highest tested ratioρ N/K = 20, IA-BP-JPDA achieves a time-
+averaged GOSPA of27.16 mand a mean IDSW of14.30
+per run. Although the performance degrades with increasing
+non-key-target interference, the results remain favorable, in-
+dicating graceful degradation under increasing non-key-target
+interference.
+D. Ablation Study
+To isolate the contributions of the onboard measurement-
+association branch and the proposed uncertainty-aware anchor-
+3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20
+Non-key/key-target ratio ρN/K
+16
+18
+20
+22
+24
+26
+28Time-averaged GOSPA (m)
+IA-BP-JPDA
+(a) Time-averaged GOSPA.
+3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20
+Non-key/key-target ratio ρN/K
+8
+10
+12
+14
+16Mean IDSW per run
+IA-BP-JPDA
+(b) Mean IDSW per run.
+Fig. 5: Sensitivity of IA-BP-JPDA to theρ N/K.
+management mechanism, we consider two ablated variants of
+IA-BP-JPDA.
+1) Surveillance-only:This variant removes anonymous on-
+board measurements and the BP-JPDA update, maintaining
+key-target tracks using surveillance reports and recursive pre-
+diction only. It evaluates the contribution of the measurement-
+association branch.
+2) Hard-anchor:This variant directly uses each available
+surveillance report as the association anchor instead of covari-
+ance fusion with the recursive prediction, while disabling the
+bounded fallback. It evaluates the proposed uncertainty-aware
+anchor-management mechanism.
+All variants are evaluated using the same 100 paired Monte
+Carlo runs and the same closed-loop fusion, assignment,
+and control modules. Since the ablation study focuses on
+the identity-anchored association mechanism, performance is
+evaluated using GOSPA and IDSW. The downstream closed-
+loop pursuit performance has already been evaluated in Sec-
+tion V-C.
+Fig. 6 compares IA-BP-JPDA with the two variants. After
+the initial transient, IA-BP-JPDA achieves a lower mean
+GOSPA from approximately7 sonward. Att= 30 s, the mean
+GOSPA values are9.48 m,25.33 m, and27.17 mfor IA-BP-
+JPDA, Hard-anchor, and Surveillance-only, respectively. These
+results support the contributions of both onboard measure-
+ment association and the proposed anchor-management mech-
+anism to tracking accuracy. In terms of identity continuity,
+Surveillance-only and Hard-anchor yield13.89and17.30ID
+
+========== PAGE 8 ==========
+0 5 10 15 20 25 30
+Time (s)
+20
+40
+60
+80GOSPA distance (m)
+Surveillance-only
+Hard-anchor
+IA-BP-JPDA
+Fig. 6: GOSPA performance of IA-BP-JPDA and its ablated
+variants.
+switches per run, respectively, compared with11.66for IA-
+BP-JPDA, indicating the benefit of the proposed mechanism
+for preserving key-target identities.
+VI. CONCLUSION
+This paper studied multi-UA V tracking of a small set of key
+targets in the presence of numerous non-key targets. The task
+is challenging because identity-bearing surveillance reports are
+intermittent and inaccurate, while high-rate onboard measure-
+ments are anonymous. We propose IA-BP-JPDA to address the
+association ambiguity. It constructs uncertainty-aware identity
+anchors via covariance-based fusion of recursive predictions
+and surveillance reports, and then uses these anchors to
+guide the BP-JPDA association of onboard measurements. A
+bounded fallback maintains short-term track continuity when
+onboard measurement support is temporarily unavailable.
+IA-BP-JPDA is fully model-based and requires neither
+labeled training data nor target-specific motion patterns or
+historical trajectories. Experiments over 100 paired Monte
+Carlo runs showed improved tracking accuracy, identity conti-
+nuity, and closed-loop pursuit over representative MTT base-
+lines. In particular, IA-BP-JPDA reduced the time-averaged
+GOSPA by51.6%relative to BP-JPDA, achieved the low-
+est IDSW among the compared methods, and operated well
+within the0.5 ssampling interval. Sensitivity analysis showed
+that the performance degrades gradually as distractor density
+increases. The ablation results further confirmed the contri-
+butions of the onboard measurement-association branch and
+the uncertainty-aware anchor-management mechanism. Future
+work will investigate adaptive uncertainty estimation, more
+realistic communication-channel modeling, and the integration
+of key-target tracking with subsequent cooperative multi-UA V
+communication jamming.
+REFERENCES
+[1] S. Kravchuk and I. Kravchuk, “Technologies and systems for countering
+threats from small drones,” inInternational Scientific and Technical
+Conference-Modern Challenges in Telecommunications. Springer, 2024,
+pp. 291–306.
+[2] P. Valianti, S. Papaioannou, P. Kolios, and G. Ellinas, “Multi-agent
+coordinated close-in jamming for disabling a rogue drone,”IEEE
+Transactions on Mobile Computing, vol. 21, no. 10, pp. 3700–3717,
+2021.
+[3] W. Yi, Y . Yuan, R. Hoseinnezhad, and L. Kong, “Resource scheduling
+for distributed multi-target tracking in netted colocated MIMO radar
+systems,”IEEE Transactions on Signal Processing, vol. 68, pp. 1602–
+1617, 2020.
+[4] Y . Yuan, W. Yi, T. Kirubarajan, and L. Kong, “Scaled accuracy based
+power allocation for multi-target tracking with colocated MIMO radars,”
+Signal Processing, vol. 158, pp. 227–240, 2019.
+[5] F. R. Kschischang, B. J. Frey, and H.-A. Loeliger, “Factor graphs and
+the sum-product algorithm,”IEEE Transactions on Information Theory,
+vol. 47, no. 2, pp. 498–519, 2001.
+[6] J. Williams and R. Lau, “Approximate evaluation of marginal association
+probabilities with belief propagation,”IEEE Transactions on Aerospace
+and Electronic Systems, vol. 50, no. 4, pp. 2942–2959, 2014.
+[7] F. Meyer, T. Kropfreiter, J. L. Williams, R. Lau, F. Hlawatsch, P. Braca,
+and M. Z. Win, “Message passing algorithms for scalable multitarget
+tracking,”Proceedings of the IEEE, vol. 106, no. 2, pp. 221–259, 2018.
+[8] Z. Xia, J. Du, J. Wang, C. Jiang, Y . Ren, G. Li, and Z. Han, “Multi-
+agent reinforcement learning aided intelligent UA V swarm for target
+tracking,”IEEE Transactions on Vehicular Technology, vol. 71, no. 1,
+pp. 931–945, 2021.
+[9] P. Valianti, K. Malialis, P. Kolios, and G. Ellinas, “Cooperative search
+and track of rogue drones using multiagent reinforcement learning,” in
+2024 IEEE International Conference on Systems, Man, and Cybernetics
+(SMC). IEEE, 2024, pp. 2091–2096.
+[10] M. Zhang, X. Wu, J. Li, X. Wang, and L. Shen, “Integrated design of
+cooperative area coverage and target tracking with multi-UA V system,”
+Journal of Intelligent & Robotic Systems, vol. 108, no. 4, p. 77, 2023.
+[11] T. Kropfreiter, F. Meyer, D. F. Crouse, S. Coraluppi, F. Hlawatsch, and
+P. Willett, “Track coalescence and repulsion in multitarget tracking: An
+analysis of MHT, JPDA, and belief propagation methods,”IEEE Open
+Journal of Signal Processing, vol. 5, pp. 1089–1106, 2024.
+[12] M. Sun, M. E. Davies, I. K. Proudler, and J. R. Hopgood, “Adaptive
+kernel Kalman filter based belief propagation algorithm for maneuvering
+multi-target tracking,”IEEE Signal Processing Letters, vol. 29, pp.
+1452–1456, 2022.
+[13] X. Bai, H. Lan, Z. Wang, Q. Pan, Y . Hao, and C. Li, “Robust multitarget
+tracking in interference environments: A message-passing approach,”
+IEEE Transactions on Aerospace and Electronic Systems, vol. 60, no. 1,
+pp. 360–386, 2023.
+[14] S. Reuter, B.-T. V o, B.-N. V o, and K. Dietmayer, “The labeled multi-
+bernoulli filter,”IEEE Transactions on Signal Processing, vol. 62, no. 12,
+pp. 3246–3260, 2014.
+[15] B.-N. V o, B.-T. V o, and D. Phung, “Labeled random finite sets and
+the Bayes multi-target tracking filter,”IEEE Transactions on Signal
+Processing, vol. 62, no. 24, pp. 6554–6567, 2014.
+[16] X. Bai, Z. Wang, Q. Pan, T. Yun, and H. Lan, “Classification-aided
+robust multiple target tracking using neural enhanced message passing,”
+IEEE Transactions on Aerospace and Electronic Systems, vol. 61, no. 2,
+pp. 3882–3903, 2024.
+[17] D. Gaglione, P. Braca, G. Soldi, F. Meyer, F. Hlawatsch, and M. Z.
+Win, “Fusion of sensor measurements and target-provided information in
+multitarget tracking,”IEEE Transactions on Signal Processing, vol. 70,
+pp. 322–336, 2021.
+[18] H. A. P. Blom and Y . Bar-Shalom, “The interacting multiple model
+algorithm for systems with Markovian switching coefficients,”IEEE
+Transactions on Automatic Control, vol. 33, no. 8, pp. 780–783, Aug.
+1988.
+[19] S. J. Julier and J. K. Uhlmann, “A non-divergent estimation algorithm
+in the presence of unknown correlations,” inProceedings of the 1997
+American Control Conference, vol. 4, 1997, pp. 2369–2373.
+[20] R. E. Burkard, M. Dell’Amico, and S. Martello,Assignment Problems.
+Philadelphia, PA, USA: Society for Industrial and Applied Mathematics,
+2009.
+[21] B.-N. V o and W.-K. Ma, “The Gaussian mixture probability hypothesis
+density filter,”IEEE Transactions on Signal Processing, vol. 54, no. 11,
+pp. 4091–4104, 2006.
+[22] A. S. Rahmathullah, A. F. Garc ´ıa-Fern´andez, and L. Svensson, “Gener-
+alized optimal sub-pattern assignment metric,” inProc. 20th Int. Conf.
+Information Fusion (Fusion), Xi’an, China, 2017, pp. 182–189.

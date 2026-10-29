@@ -106,6 +106,7 @@ class _BPJPDAAgentContext:
     predicted_means: tuple[np.ndarray, ...]
     predicted_covariances: tuple[np.ndarray, ...]
     predicted_motion_states: tuple[IMMMotionState, ...]
+    track_initialized: np.ndarray
     track_active: np.ndarray
     report_valid_mask: np.ndarray
     likelihood_ratios: np.ndarray
@@ -1815,14 +1816,15 @@ def _build_bp_jpda_context(
     predicted_covariances: list[np.ndarray] = []
     predicted_motion_states: list[IMMMotionState] = []
     previous_missed_counts: list[int] = []
-    track_active = np.ones(prior_relative_states.shape[0], dtype=bool)
+    track_initialized = np.zeros(prior_relative_states.shape[0], dtype=bool)
+    track_active = np.zeros(prior_relative_states.shape[0], dtype=bool)
     for target_idx in range(prior_relative_states.shape[0]):
         previous_track_state = previous_filter_state.get(target_idx)
         if _is_filter_state_expired(previous_track_state, max_missed_steps):
             previous_track_state = None
         prior_available = bool(prior_valid_mask[target_idx])
-        if not prior_available and previous_track_state is None:
-            track_active[target_idx] = False
+        track_initialized[target_idx] = prior_available or previous_track_state is not None
+        track_active[target_idx] = track_initialized[target_idx]
         previous_missed_counts.append(_previous_missed_count(previous_track_state))
         predicted_mean, predicted_covariance, predicted_motion_state = _bp_jpda_predict_track_state(
             previous_filter_state=previous_track_state,
@@ -1937,6 +1939,7 @@ def _build_bp_jpda_context(
         predicted_means=tuple(predicted_means),
         predicted_covariances=tuple(predicted_covariances),
         predicted_motion_states=tuple(predicted_motion_states),
+        track_initialized=track_initialized,
         track_active=track_active,
         report_valid_mask=prior_valid_mask.astype(bool, copy=True),
         likelihood_ratios=likelihood_ratios,
@@ -2107,6 +2110,7 @@ def _build_bp_jpda_tracks_from_marginals(
         # anchor_fallback_valid = bool(allow_anchor_fallback_valid and context.track_active[target_idx])
         anchor_fallback_valid = bool(
             allow_anchor_fallback_valid
+            and context.track_initialized[target_idx]
             and (context.track_active[target_idx] or current_report_valid)
         )
         output_confidence = (
@@ -2205,7 +2209,10 @@ def _build_bp_jpda_tracks_from_marginals(
                 max_missed_steps=max_missed_steps,
             )
         )
-        if has_measurement_support or missed_count < _sanitize_max_missed_steps(max_missed_steps):
+        # Missing-report placeholders must never become recursive tracks.
+        if context.track_initialized[target_idx] and (
+            has_measurement_support or missed_count < _sanitize_max_missed_steps(max_missed_steps)
+        ):
             agent_next_states[target_idx] = BPJPDAFilterState(
                 mean=posterior_state.astype(float, copy=True),
                 covariance=posterior_covariance.astype(float, copy=True),
@@ -2392,15 +2399,16 @@ def bp_jpda_association_for_friendlies(
         predicted_covariances: list[np.ndarray] = []
         predicted_motion_states: list[IMMMotionState] = []
         previous_missed_counts: list[int] = []
-        track_active = np.ones(prior_relative_states.shape[0], dtype=bool)
+        track_initialized = np.zeros(prior_relative_states.shape[0], dtype=bool)
+        track_active = np.zeros(prior_relative_states.shape[0], dtype=bool)
         agent_previous_states = previous_states.get(str(agent_id), {})
         for target_idx in range(prior_relative_states.shape[0]):
             previous_track_state = agent_previous_states.get(target_idx)
             if _is_filter_state_expired(previous_track_state, max_missed_steps):
                 previous_track_state = None
             prior_available = bool(prior_valid_mask[target_idx])
-            if not prior_available and previous_track_state is None:
-                track_active[target_idx] = False
+            track_initialized[target_idx] = prior_available or previous_track_state is not None
+            track_active[target_idx] = track_initialized[target_idx]
             previous_missed_counts.append(_previous_missed_count(previous_track_state))
             initialization_prior_available = bool(prior_available and previous_track_state is None)
             predicted_mean, predicted_covariance, predicted_motion_state = _bp_jpda_predict_track_state(
@@ -2575,7 +2583,10 @@ def bp_jpda_association_for_friendlies(
                 has_measurement_support=has_measurement_support,
                 max_missed_steps=max_missed_steps,
             )
-            if has_measurement_support or missed_count < _sanitize_max_missed_steps(max_missed_steps):
+            # Keep an absent label uninitialized until its first valid report.
+            if track_initialized[target_idx] and (
+                has_measurement_support or missed_count < _sanitize_max_missed_steps(max_missed_steps)
+            ):
                 agent_next_states[target_idx] = BPJPDAFilterState(
                     mean=posterior_state.astype(float, copy=True),
                     covariance=posterior_covariance.astype(float, copy=True),

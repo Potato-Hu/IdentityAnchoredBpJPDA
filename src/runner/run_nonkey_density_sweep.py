@@ -32,6 +32,7 @@ _MARKER_SIZE = 5
 _MARKER_EDGE_WIDTH = 1
 _CI_ALPHA = 0.08
 _METHOD_COLOR = "#0072B2"
+_IDSW_COLOR = "#D55E00"
 
 
 def _scenario_output_name() -> str:
@@ -202,6 +203,86 @@ def _plot_density_metric(
         plt.close(fig)
 
 
+def _plot_density_metrics_combined(
+    *,
+    ratios: np.ndarray,
+    gospa_summary: tuple[np.ndarray, np.ndarray, np.ndarray],
+    idsw_summary: tuple[np.ndarray, np.ndarray, np.ndarray],
+    save_path: Path,
+    show_confidence_interval: bool,
+    show: bool,
+) -> None:
+    max_value = max(
+        float(np.max(summary[2 if show_confidence_interval else 0]))
+        for summary in (gospa_summary, idsw_summary)
+    )
+    y_upper = max(10.0, 5.0 * np.ceil(max_value / 5.0))
+    with sns.axes_style("whitegrid"), sns.plotting_context("notebook"):
+        fig, gospa_ax = plt.subplots(figsize=_FIGURE_SIZE)
+        idsw_ax = gospa_ax.twinx()
+        lines = []
+        for ax, summary, color, linestyle, marker, label, ylabel in (
+            (gospa_ax, gospa_summary, _METHOD_COLOR, "-", "o", "GOSPA", "Time-averaged GOSPA (m)"),
+            (idsw_ax, idsw_summary, _IDSW_COLOR, "--", "s", "IDSW", "Mean IDSW per run"),
+        ):
+            mean, lower, upper = summary
+            if show_confidence_interval:
+                ax.fill_between(
+                    ratios, lower, upper, color=color, alpha=_CI_ALPHA,
+                    linewidth=0.0, zorder=1,
+                )
+            line, = ax.plot(
+                ratios, mean, color=color, linestyle=linestyle,
+                linewidth=_LINE_WIDTH, marker=marker, markersize=_MARKER_SIZE,
+                markerfacecolor="none", markeredgecolor=color,
+                markeredgewidth=_MARKER_EDGE_WIDTH, zorder=3, label=label,
+            )
+            lines.append(line)
+            ax.set_ylabel(ylabel, fontsize=_AXIS_LABEL_SIZE, color=color)
+            # Leave a small gap below the first labeled tick at 5.
+            ax.set_ylim(4.5, y_upper)
+            ax.set_yticks(np.arange(5.0, y_upper + 0.5, 5.0))
+            is_left = ax is gospa_ax
+            ax.tick_params(
+                axis="y", which="major", direction="in", length=6, width=1.0,
+                colors=color, labelsize=_TICK_LABEL_SIZE,
+                left=is_left, right=not is_left,
+                labelleft=is_left, labelright=not is_left,
+            )
+
+    if ratios.size == 1:
+        gospa_ax.set_xlim(float(ratios[0]) - 0.5, float(ratios[0]) + 0.5)
+    else:
+        gospa_ax.set_xlim(float(ratios[0]), float(ratios[-1]))
+    gospa_ax.margins(x=0.0)
+    gospa_ax.set_xticks(ratios)
+    gospa_ax.set_xlabel(r"Non-key/key-target ratio $\rho_{\mathrm{N/K}}$", fontsize=_AXIS_LABEL_SIZE)
+    gospa_ax.tick_params(
+        axis="x", which="major", direction="in", length=6, width=1.0,
+        colors="black", labelsize=_TICK_LABEL_SIZE, bottom=True, top=False,
+    )
+    gospa_ax.grid(True, which="major", alpha=0.3, color="#88888A", linewidth=0.8)
+    gospa_ax.grid(False, which="minor")
+    idsw_ax.grid(False)
+    gospa_ax.legend(
+        handles=lines, loc="upper center", bbox_to_anchor=(0.5, 1.02),
+        frameon=False, fontsize=_LEGEND_SIZE, ncol=2, handlelength=2.4,
+    )
+    sns.despine(ax=gospa_ax, offset=0)
+    sns.despine(ax=idsw_ax, left=True, right=False, bottom=True, offset=0)
+    gospa_ax.spines["left"].set_color("black")
+    gospa_ax.spines["bottom"].set_color("black")
+    idsw_ax.spines["right"].set_color("black")
+    fig.tight_layout()
+
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(save_path, bbox_inches="tight")
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+
+
 def plot_nonkey_density_sweep_csv(
     *,
     csv_path: str | Path,
@@ -251,6 +332,7 @@ def plot_nonkey_density_sweep_csv(
 
     gospa_pdf_path = output_root / "nonkey_density_mean_gospa.pdf"
     idsw_pdf_path = output_root / "nonkey_density_idsw.pdf"
+    combined_pdf_path = output_root / "nonkey_density_gospa_idsw_combined.pdf"
     _plot_density_metric(
         ratios=ratios,
         mean=gospa_mean,
@@ -271,16 +353,26 @@ def plot_nonkey_density_sweep_csv(
         show_confidence_interval=show_confidence_interval,
         show=show,
     )
+    _plot_density_metrics_combined(
+        ratios=ratios,
+        gospa_summary=(gospa_mean, gospa_lower, gospa_upper),
+        idsw_summary=(idsw_mean, idsw_lower, idsw_upper),
+        save_path=combined_pdf_path,
+        show_confidence_interval=show_confidence_interval,
+        show=show,
+    )
 
     print(f"Loaded density-sweep metrics: {Path(csv_path)}")
     print(f"Saved density-sweep summary: {summary_csv_path}")
     print(f"Saved density-sweep GOSPA figure: {gospa_pdf_path}")
     print(f"Saved density-sweep IDSW figure: {idsw_pdf_path}")
+    print(f"Saved density-sweep combined figure: {combined_pdf_path}")
     return {
         "run_metrics_csv": Path(csv_path),
         "summary_csv": summary_csv_path,
         "gospa_pdf": gospa_pdf_path,
         "idsw_pdf": idsw_pdf_path,
+        "combined_pdf": combined_pdf_path,
     }
 
 

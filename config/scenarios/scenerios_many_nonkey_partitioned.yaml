@@ -3,7 +3,7 @@ extends: scenerios_base
 entity_counts:
   # Configure this clutter-heavy scene directly instead of inheriting the key /
   # friendly counts implicitly from the base scenario.
-  friendly_uavs: 5
+  friendly_uavs: 3
   key_targets: 3
   nonkey_targets: 30
 
