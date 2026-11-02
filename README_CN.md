@@ -142,14 +142,23 @@ python -m src.runner.run_nonkey_density_sweep \
   --ratios 3 5 10 15 20
 ```
 
-该实验固定使用 `labeled_anchor_bp_jpda`。总运行次数等于“种子数 × 比例数”，大规模参数会耗时较长。
+该实验默认对比 `labeled_anchor_bp_jpda`（IA-BP-JPDA）和 `bp_jpda`，两种方法在每个比例下使用相同的 seed。总运行次数等于“方法数 × 种子数 × 比例数”，也可以用 `--methods` 选择其中的方法。
 
-实验结束后，在同一输出目录生成 GOSPA、IDSW 两张独立图，以及双纵轴合并图 `nonkey_density_gospa_idsw_combined.pdf`。合并图用左轴蓝色实线表示 GOSPA，右轴橙色虚线表示 IDSW。
-也可以直接从已保存的逐次实验 CSV 重新生成三张图：
+逐次实验和汇总 CSV 均通过 `method` 字段分别记录两种方法的结果。两张独立图 `nonkey_density_mean_gospa.pdf` 和 `nonkey_density_idsw.pdf` 均用蓝色实线圆点表示 IA-BP-JPDA，橙色虚线方点表示 BP-JPDA。输出目录保持为 `outputs/figure/<场景>/nonkey_density_sweep/labeled_anchor_bp_jpda/`。
+
+已有 IA-BP-JPDA 的 100 种子结果时，在相同场景和感知配置下，使用 `--resume` 保留已有记录，只补跑缺少的 BP-JPDA 结果；中断后也可用同一命令继续：
+
+```bash
+python -m src.runner.run_nonkey_density_sweep --num-seeds 100 --start-seed 0 --key-num 3 --resume
+```
+
+直接读取 CSV 重画两种方法的对比图：
 
 ```bash
 python -m src.runner.run_nonkey_density_sweep --plot-only --csv-path <nonkey_density_run_metrics.csv>
 ```
+
+绘图会校验各方法、各比例的 seed 集合一致，拒绝重复记录或不完整的配对数据；仍兼容只有 IA-BP-JPDA 的旧 CSV。双纵轴合并图 `nonkey_density_gospa_idsw_combined.pdf` 同时展示两种方法的四条曲线：蓝色对应左轴 GOSPA，橙色对应右轴 IDSW；实线圆点表示 IA-BP-JPDA，虚线方点表示 BP-JPDA。两侧使用相同的纵轴范围，轴线为黑色，标题和刻度随指标配色；只有一种方法的旧 CSV 则显示两条曲线。
 
 ## 配置说明
 

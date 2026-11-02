@@ -142,14 +142,23 @@ python -m src.runner.run_nonkey_density_sweep \
   --ratios 3 5 10 15 20
 ```
 
-This experiment always uses `labeled_anchor_bp_jpda`. The total number of runs is the number of seeds multiplied by the number of ratios, so large experiments may take a while.
+By default, this experiment compares `labeled_anchor_bp_jpda` (IA-BP-JPDA) and `bp_jpda` using the same seeds at each ratio. The total number of runs is the number of methods multiplied by the number of seeds and ratios. Use `--methods` to select either method.
 
-Each completed sweep generates separate GOSPA and IDSW figures plus `nonkey_density_gospa_idsw_combined.pdf` in the same output directory. The combined figure uses a solid blue GOSPA curve on the left axis and a dashed orange IDSW curve on the right axis.
-Regenerate all three figures directly from the saved run-level CSV with:
+Both run-level and summary CSV files identify results by `method`. The separate GOSPA and IDSW figures compare IA-BP-JPDA (solid blue circles) with BP-JPDA (dashed orange squares). The output directory remains `outputs/figure/<scenario>/nonkey_density_sweep/labeled_anchor_bp_jpda/`.
+
+To retain an existing 100-seed IA-BP-JPDA sweep and run only the missing BP-JPDA cases, use `--resume` with the same scenario and sensing configuration. The same command also resumes an interrupted sweep:
+
+```bash
+python -m src.runner.run_nonkey_density_sweep --num-seeds 100 --start-seed 0 --key-num 3 --resume
+```
+
+Regenerate the method-comparison figures directly from the saved run-level CSV with:
 
 ```bash
 python -m src.runner.run_nonkey_density_sweep --plot-only --csv-path <nonkey_density_run_metrics.csv>
 ```
+
+Plotting requires matching seed sets across all methods and ratios and rejects duplicate or incomplete paired records. Legacy IA-BP-JPDA-only CSV files remain supported. The dual-axis `nonkey_density_gospa_idsw_combined.pdf` displays four curves: blue for GOSPA on the left axis and orange for IDSW on the right axis, with solid circles for IA-BP-JPDA and dashed squares for BP-JPDA. Both axes share the same limits, with black spines and metric-colored labels and ticks. A single-method CSV produces two curves.
 
 ## Configuration
 
