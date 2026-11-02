@@ -1,8 +1,8 @@
-# SwarmJam
+# IdentityAnchoredBpJPDA
 
 English | [简体中文](README_CN.md)
 
-SwarmJam is a **key-target-prioritized multi-target tracking and data-association research platform** for cooperative multi-UAV scenarios. It simulates friendly UAVs, key targets, and non-key distractors in dynamic 3D environments, combining weak global priors, anonymous local observations, multiple association algorithms, and centralized track fusion to evaluate tracking accuracy, coverage, and identity continuity for key targets.
+IdentityAnchoredBpJPDA is a **key-target-prioritized multi-target tracking and data-association research platform** for cooperative multi-UAV scenarios. It simulates friendly UAVs, key targets, and non-key distractors in dynamic 3D environments, combining weak global priors, anonymous local observations, multiple association algorithms, and centralized track fusion to evaluate tracking accuracy, coverage, and identity continuity for key targets.
 
 > The current version focuses on multi-target tracking, data association, and cooperative tracking evaluation. It does not include a runnable reinforcement-learning training entry point.
 
@@ -220,7 +220,7 @@ Association and recursive-estimation parameters are under `association` in `conf
 ## Project Structure
 
 ```text
-SwarmJam/
+IdentityAnchoredBpJPDA/
 ├── config/                 # Global, environment, and scenario configuration
 ├── docs/                   # System model, problem formulation, and algorithm notes
 ├── outputs/                # Simulation data, metrics, and figures
@@ -245,4 +245,4 @@ SwarmJam/
 - [Project summary](docs/project_summary.md)
 - [Labeled-anchor BP-JPDA notes](docs/labeled_anchor_bp_jpda.md)
 
-SwarmJam is currently a research prototype. For reproducible experiments, fix the random seed and record the selected scenario, association method, and complete configuration.
+IdentityAnchoredBpJPDA is currently a research prototype. For reproducible experiments, fix the random seed and record the selected scenario, association method, and complete configuration.
